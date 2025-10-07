@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 import json
 import logging
+import os
 from fastapi.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -12,6 +13,9 @@ logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = FastAPI()
+
+# Get the path from an environment variable, with a default value
+OSV_SCANNER_PATH = os.getenv("OSV_SCANNER_PATH", "/root/go/bin/osv-scanner")
 
 # Pydantic model to define the structure of the request body
 
@@ -37,7 +41,7 @@ async def scan_repository(request: ScanRequest):
             logging.info(f"Cloning repository: {request.repo_url}...")
             # Clone the repo into the temporary directory
             # Run blocking I/O in a thread pool to avoid blocking the event loop
-            await run_in_threadpool(Repo.clone_from, request.repo_url, temp_dir)
+            await run_in_threadpool(Repo.clone_from, request.repo_url, temp_dir, depth=1)
             logging.info("Clone successful.")
 
         except GitCommandError as e:
@@ -51,7 +55,7 @@ async def scan_repository(request: ScanRequest):
             # Run the OSV-Scanner command as a subprocess in a thread pool
             process = await run_in_threadpool(
                 subprocess.run,
-                ["osv-scanner", "--json", temp_dir],
+                [OSV_SCANNER_PATH, "-r", "--json", temp_dir],
                 capture_output=True,
                 text=True,
                 check=False  # We will check the return code manually

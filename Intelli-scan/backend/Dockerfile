@@ -4,14 +4,13 @@ FROM python:3.11-slim
 # Set the working directory in the container
 WORKDIR /app
 
-# === ADD OSV-SCANNER INSTALLATION ===
-# Install wget and unzip which are needed to download the scanner
-RUN apt-get update && apt-get install -y wget unzip
+# === ADD OSV-SCANNER INSTALLATION (THE RIGHT WAY) ===
+# Install golang, which is the required installer for osv-scanner
+RUN apt-get update && apt-get install -y golang git nodejs npm
 
-# Download and install the OSV-Scanner for Linux AMD64
-RUN wget https://github.com/google/osv-scanner/releases/download/v2.2.3/osv-scanner_2.2.3_linux_amd64 -O /usr/local/bin/osv-scanner && \
-    chmod +x /usr/local/bin/osv-scanner
-# ====================================
+# Use the official Go installer to get the latest version of osv-scanner
+# This is more stable than a direct download link
+RUN go install github.com/google/osv-scanner/cmd/osv-scanner@latest
 
 # Copy the dependency file to the working directory
 COPY requirements.txt .
