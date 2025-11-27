@@ -4,13 +4,12 @@ FROM python:3.11-slim
 # Set the working directory in the container
 WORKDIR /app
 
-# === ADD OSV-SCANNER INSTALLATION (THE RIGHT WAY) ===
-# Install golang, which is the required installer for osv-scanner
-RUN apt-get update && apt-get install -y golang git nodejs npm
+# === ADD TRIVY INSTALLATION ===
+# Install curl (for downloading trivy), git, nodejs, and npm
+RUN apt-get update && apt-get install -y curl git nodejs npm
 
-# Use the official Go installer to get the latest version of osv-scanner
-# This is more stable than a direct download link
-RUN go install github.com/google/osv-scanner/cmd/osv-scanner@latest
+# Install Trivy
+RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
 
 # Copy the dependency file to the working directory
 COPY requirements.txt .
