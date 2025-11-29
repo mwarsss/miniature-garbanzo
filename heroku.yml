@@ -1,9 +1,0 @@
-build:
-  docker:
-    web: Intelli-scan/backend
-release:
-  image: web
-  command: 
-    - python Intelli-scan/backend/.venv/bin/uvicorn Intelli-scan/backend/main:app --host 0.0.0.0 --port $PORT
-run:
-  web: python Intelli-scan/backend/.venv/bin/uvicorn Intelli-scan/backend/main:app --host 0.0.0.0 --port $PORT
