@@ -2,6 +2,4 @@ fastapi
 uvicorn[standard]
 GitPython
 semgrep
-dramatiq[redis]
-redis
-requests
+google-generativeai
