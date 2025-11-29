@@ -4,12 +4,15 @@ FROM python:3.11-slim
 # Set the working directory in the container
 WORKDIR /app
 
-# === ADD TRIVY INSTALLATION ===
-# Install curl (for downloading trivy), git, nodejs, and npm
-RUN apt-get update && apt-get install -y curl git nodejs npm
+# === ADD TRIVY & SEMGREP INSTALLATION ===
+# Install curl (for downloading trivy), git, nodejs, npm, and python3-pip (for semgrep)
+RUN apt-get update && apt-get install -y curl git nodejs npm python3-pip
 
 # Install Trivy
 RUN curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+
+# Install Semgrep
+RUN pip3 install semgrep
 
 # Copy the dependency file to the working directory
 COPY requirements.txt .

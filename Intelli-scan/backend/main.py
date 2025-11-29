@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import shutil
-from fastapi.concurrency import run_in_threadpool
+from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from git import Repo, GitCommandError
@@ -64,13 +64,14 @@ async def scan_repository(request: ScanRequest):
                 text=True,
                 check=False
             )
-            
+
             if process_trivy.returncode != 0 and process_trivy.stderr:
                 logging.error(f"Trivy error: {process_trivy.stderr}")
                 results["sca"] = {"error": process_trivy.stderr}
             elif not process_trivy.stdout:
                 logging.warning("Trivy produced no output.")
-                results["sca"] = {"message": "No dependencies found or no output produced."}
+                results["sca"] = {
+                    "message": "No dependencies found or no output produced."}
             else:
                 try:
                     results["sca"] = json.loads(process_trivy.stdout)
@@ -97,8 +98,8 @@ async def scan_repository(request: ScanRequest):
             # Semgrep returns exit code 0 on success (clean or issues found), 1 on fatal error.
             # However, it writes JSON to stdout even if issues are found.
             if process_semgrep.returncode != 0 and not process_semgrep.stdout:
-                 logging.error(f"Semgrep error: {process_semgrep.stderr}")
-                 results["sast"] = {"error": process_semgrep.stderr}
+                logging.error(f"Semgrep error: {process_semgrep.stderr}")
+                results["sast"] = {"error": process_semgrep.stderr}
             else:
                 try:
                     results["sast"] = json.loads(process_semgrep.stdout)
