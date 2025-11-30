@@ -1,5 +1,7 @@
 'use client';
 import React, { useState, useEffect } from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import {
   Shield,
   Search,
@@ -49,6 +51,7 @@ export default function Dashboard() {
   const [currentScan, setCurrentScan] = useState<ScanResult | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | null>(null);
   const [remediationPlan, setRemediationPlan] = useState<Remediation[] | null>(null);
+  const pathname = usePathname();
 
   // Handles initiating a scan via the backend API
   const handleScan = async () => {
@@ -157,10 +160,10 @@ export default function Dashboard() {
         </div>
 
         <nav className="flex-1 px-4 space-y-2 mt-4">
-          <NavItem icon={<Activity />} label="Dashboard" active={true} />
-          <NavItem icon={<Server />} label="Scans" />
-          <NavItem icon={<Lock />} label="Policies" />
-          <NavItem icon={<FileCode />} label="Reports" />
+          <NavItem icon={<Activity />} label="Dashboard" href="/" />
+          <NavItem icon={<Server />} label="Scans" href="/scans" />
+          <NavItem icon={<Lock />} label="Policies" href="/policies" />
+          <NavItem icon={<FileCode />} label="Reports" href="/reports" />
         </nav>
 
         <div className="p-4 border-t border-slate-800">
@@ -377,18 +380,24 @@ export default function Dashboard() {
   );
 }
 
-function NavItem({ icon, label, active = false }: { icon: React.ReactNode, label: string, active?: boolean }) {
-  return (
-    <button className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${
+function NavItem({ icon, label, href }: { icon: React.ReactNode, label: string, href: string }) {
+  const pathname = usePathname();
+  const active = pathname === href;
+
+  const content = (
+    <div className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${
       active
         ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
         : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
     }`}>
       {React.cloneElement(icon as React.ReactElement, { size: 18 })}
       {label}
-    </button>
+    </div>
   );
+
+  return ( <Link href={href}>{content}</Link> );
 }
+
 
 function StatCard({ label, value, color }: { label: string, value: string, color: string }) {
   return (
