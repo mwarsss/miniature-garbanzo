@@ -53,34 +53,28 @@ export default function ScansPage() {
   const [statusFilter, setStatusFilter] = useState('all');
 
   // Fetch scans from Backend
-  useEffect(() => {
-    const fetchScans = async () => {
-      try {
-        // In prod, use process.env.NEXT_PUBLIC_API_URL
-        const res = await fetch('http://localhost:8000/scans?limit=50');
-        if (res.ok) {
-          const data = await res.json();
-          setScans(data);
-        } else {
-          // Fallback Mock Data for demo if API fails
-          console.warn("API unavailable, using mock data");
-          setScans([
-            { id: 105, repo_url: 'https://github.com/juice-shop/juice-shop', status: 'completed', submit_time: new Date(Date.now() - 1000 * 60 * 5).toISOString() },
-            { id: 104, repo_url: 'https://github.com/fastapi/fastapi', status: 'processing', submit_time: new Date(Date.now() - 1000 * 60 * 2).toISOString() },
-            { id: 103, repo_url: 'https://github.com/facebook/react', status: 'failed', submit_time: new Date(Date.now() - 1000 * 60 * 60 * 2).toISOString() },
-            { id: 102, repo_url: 'https://github.com/vercel/next.js', status: 'completed', submit_time: new Date(Date.now() - 1000 * 60 * 60 * 24).toISOString() },
-          ]);
+    useEffect(() => {
+      const fetchScans = async () => {
+        setLoading(true);
+        try {
+          const res = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/scans?limit=50');
+          if (res.ok) {
+            const data = await res.json();
+            setScans(data);
+          } else {
+            console.error("Failed to fetch scans:", res.status, await res.text());
+            setScans([]); // Clear scans on error
+          }
+        } catch (error) {
+          console.error("Connection failed:", error);
+          setScans([]); // Clear scans on error
+        } finally {
+          setLoading(false);
         }
-      } catch (error) {
-        console.error("Connection failed", error);
-      } finally {
-        setLoading(false);
-      }
-    };
-
-    fetchScans();
-  }, []);
-
+      };
+  
+      fetchScans();
+    }, []);
   // Filter Logic
   const filteredScans = scans.filter(scan => {
     const matchesSearch = scan.repo_url.toLowerCase().includes(searchTerm.toLowerCase());

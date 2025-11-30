@@ -1,5 +1,2 @@
-fastapi
-uvicorn[standard]
-GitPython
-semgrep
-google-generativeai
+
+psycopg2-binary
