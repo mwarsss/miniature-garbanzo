@@ -12,7 +12,8 @@ import {
   Cpu,
   Lock,
   Activity,
-  FileCode
+  FileCode,
+  X
 } from 'lucide-react';
 
 // --- Types for our Data ---
@@ -35,12 +36,19 @@ interface AIAnalysis {
   }[];
 }
 
+interface Remediation {
+  issue: string;
+  fix_code: string;
+  explanation: string;
+}
+
 export default function Dashboard() {
   const [repoUrl, setRepoUrl] = useState('');
   const [isScanning, setIsScanning] = useState(false);
   const [activeTab, setActiveTab] = useState('overview');
   const [currentScan, setCurrentScan] = useState<ScanResult | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | null>(null);
+  const [remediationPlan, setRemediationPlan] = useState<Remediation[] | null>(null);
 
   // Handles initiating a scan via the backend API
   const handleScan = async () => {
@@ -48,6 +56,7 @@ export default function Dashboard() {
     setIsScanning(true);
     setCurrentScan(null); // Clear previous scan results
     setAiAnalysis(null);
+    setRemediationPlan(null);
 
     try {
       const response = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/scan', {
@@ -64,7 +73,7 @@ export default function Dashboard() {
 
       const data = await response.json();
       setCurrentScan({
-        id: data.result.scan_id,
+        id: data.scan_id,
         repo_url: repoUrl,
         status: data.status,
         timestamp: new Date().toISOString(),
@@ -74,6 +83,20 @@ export default function Dashboard() {
       console.error("Error starting scan:", error);
       setIsScanning(false);
       // Optionally, set an error state to display to the user
+    }
+  };
+
+  // Fetch remediation plan
+  const handleViewRemediation = async (scanId: string) => {
+    try {
+      const response = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${scanId}/remediation`);
+      if (!response.ok) {
+        throw new Error(`HTTP error! status: ${response.status}`);
+      }
+      const data = await response.json();
+      setRemediationPlan(data.remediations);
+    } catch (error) {
+      console.error("Error fetching remediation plan:", error);
     }
   };
 
@@ -111,7 +134,7 @@ export default function Dashboard() {
           console.error("Error polling scan status:", error);
           if (interval) clearInterval(interval);
           setIsScanning(false);
-          setCurrentScan(prev => ({ ...prev!, status: 'failed', message: 'Network or server error during polling.' }));
+          setCurrentScan(prev => ({ ...prev!, status: 'failed' }));
         }
       }, 2000); // Poll every 2 seconds
     }
@@ -298,7 +321,10 @@ export default function Dashboard() {
                         </p>
                       </div>
 
-                      <button className="mt-3 text-sm text-indigo-400 hover:text-indigo-300 font-medium flex items-center gap-1 group/btn">
+                      <button
+                        onClick={() => handleViewRemediation(currentScan.id)}
+                        className="mt-3 text-sm text-indigo-400 hover:text-indigo-300 font-medium flex items-center gap-1 group/btn"
+                      >
                         View Remediation Plan
                         <ChevronRight className="h-4 w-4 group-hover/btn:translate-x-1 transition-transform" />
                       </button>
@@ -306,7 +332,6 @@ export default function Dashboard() {
                   ))}
                 </div>
               </div>
-
             </div>
           </div>
         )}
@@ -318,6 +343,32 @@ export default function Dashboard() {
             </div>
             <p className="text-lg font-medium">Ready to scan.</p>
             <p className="text-sm">Enter a repository URL above to begin analysis.</p>
+          </div>
+        )}
+
+        {remediationPlan && (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm flex items-center justify-center z-50">
+            <div className="bg-slate-900 border border-slate-700 rounded-2xl shadow-2xl w-full max-w-2xl max-h-[80vh] flex flex-col">
+              <div className="flex justify-between items-center p-4 border-b border-slate-800">
+                <h2 className="text-lg font-bold text-white">Remediation Plan</h2>
+                <button onClick={() => setRemediationPlan(null)} className="p-2 rounded-full hover:bg-slate-800">
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+              <div className="p-6 overflow-y-auto">
+                <div className="space-y-6">
+                  {remediationPlan.map((rem, idx) => (
+                    <div key={idx} className="bg-slate-950/50 border border-slate-800 rounded-xl p-4">
+                       <h4 className="font-bold text-slate-200 mb-2">{rem.issue}</h4>
+                       <p className="text-sm text-slate-400 mb-3">{rem.explanation}</p>
+                       <div className="bg-slate-900 rounded-lg p-3 border border-slate-800">
+                         <pre><code className="text-xs text-slate-400 font-mono">{rem.fix_code}</code></pre>
+                       </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
           </div>
         )}
 

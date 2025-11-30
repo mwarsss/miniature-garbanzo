@@ -59,6 +59,14 @@ class AIAnalysisResult(BaseModel):
     summary: str
     top_vulnerabilities: List[Vulnerability]
 
+class RemediationDetail(BaseModel):
+    issue: str
+    fix_code: str
+    explanation: str
+
+class RemediationResult(BaseModel):
+    remediations: List[RemediationDetail]
+
 class ScanRequest(BaseModel):
     repo_url: str
 
@@ -92,7 +100,7 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> AIAnalysi
     {{"name": "Hardcoded Private Key", "severity": "CRITICAL", "file": "lib/insecurity.ts", "poc": "Attacker extracts key from repo and signs JWTs."}}
     """
     try:
-        response = await model.generate_content(prompt)
+        response = await model.generate_content_async(prompt)
         ai_output = response.text
         logging.info(f"AI Raw Output: {ai_output}")
         # Attempt to parse the JSON output from the model
@@ -101,6 +109,45 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> AIAnalysi
     except Exception as e:
         logging.error(f"AI analysis failed: {e}")
         return AIAnalysisResult(summary=f"AI analysis failed: {e}", top_vulnerabilities=[])
+
+async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> RemediationResult:
+    if not GOOGLE_API_KEY:
+        logging.warning("GOOGLE_API_KEY not set, skipping AI remediation.")
+        return RemediationResult(remediations=[])
+
+    prompt = f"""
+    You are a senior software security engineer. Your task is to provide a
+    remediation plan for the following security scan results. For each finding,
+    provide the exact code change required to fix the issue.
+
+    Scan Data:
+    SCA Results (Trivy): {json.dumps(sca_result, indent=2)}
+    SAST Results (Semgrep): {json.dumps(sast_result, indent=2)}
+
+    Generate a JSON object that strictly adheres to the following schema.
+    Do not include any explanations or markdown formatting outside of the JSON object.
+
+    Schema:
+    {{
+      "remediations": [
+        {{
+          "issue": "Vuln Name",
+          "fix_code": "The actual code snippet to fix it",
+          "explanation": "Why this fix works"
+        }}
+      ]
+    }}
+    """
+    try:
+        response = await model.generate_content_async(prompt)
+        ai_output = response.text
+        logging.info(f"AI Raw Remediation Output: {ai_output}")
+        # Attempt to parse the JSON output from the model
+        parsed_output = json.loads(ai_output)
+        return RemediationResult(**parsed_output)
+    except Exception as e:
+        logging.error(f"AI remediation failed: {e}")
+        return RemediationResult(remediations=[])
 
 # --- Background Task Logic ---
 async def _perform_scan(scan_id: str, repo_url: str):
@@ -203,3 +250,21 @@ async def get_scan_status(scan_id: str):
         message=status_data.get("message"),
         result=ScanResultData(**status_data.get("result")) if status_data.get("result") else None
     )
+
+@app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
+async def get_remediation_plan(scan_id: str):
+    """
+    Generates and retrieves the remediation plan for a completed scan.
+    """
+    if scan_id not in SCAN_RESULTS:
+        raise HTTPException(status_code=404, detail="Scan ID not found.")
+
+    scan_data = SCAN_RESULTS[scan_id]
+    if scan_data.get("status") != "completed":
+        raise HTTPException(status_code=400, detail="Scan is not yet completed.")
+
+    sca_result = scan_data.get("result", {}).get("sca", {})
+    sast_result = scan_data.get("result", {}).get("sast", {})
+
+    remediation_plan = await _perform_ai_remediation(sca_result, sast_result)
+    return remediation_plan
