@@ -1,6 +1,8 @@
 'use client';
 
 import React, { useState, useEffect } from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import { 
   ShieldCheck, 
   Lock, 
@@ -11,7 +13,11 @@ import {
   FileText,
   Upload,
   Trash2,
-  Plus
+  Plus,
+  Shield,
+  Activity,
+  Server,
+  FileCode
 } from 'lucide-react';
 
 interface Policy {
@@ -128,134 +134,183 @@ export default function PoliciesPage() {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-200 p-8">
+    <div className="min-h-screen bg-slate-950 text-slate-200 font-sans selection:bg-indigo-500 selection:text-white">
       
-      <header className="mb-8">
-        <div className="flex items-center gap-3 mb-2">
-          <div className="p-2 bg-emerald-500/10 rounded-lg border border-emerald-500/20">
-            <ShieldCheck className="h-6 w-6 text-emerald-400" />
+      <aside className="fixed left-0 top-0 h-full w-64 bg-slate-900 border-r border-slate-800 flex flex-col">
+        <div className="p-6 flex items-center gap-3">
+          <div className="h-8 w-8 bg-indigo-600 rounded-lg flex items-center justify-center shadow-lg shadow-indigo-500/20">
+            <Shield className="text-white h-5 w-5" />
           </div>
-          <h1 className="text-3xl font-bold text-white">Security Policies</h1>
+          <span className="font-bold text-xl tracking-tight text-white">IntelliScan</span>
         </div>
-        <p className="text-slate-400">Configure rules and upload organization standards for the AI Agent.</p>
-      </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
-        
-        {/* --- LEFT COL: RULES --- */}
-        <div className="lg:col-span-2 space-y-6">
-          <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-            <Lock className="h-5 w-5 text-indigo-400" />
-            Enforcement Rules
-          </h2>
-          
-          {loading ? (
-            <div className="p-12 flex justify-center text-slate-500">
-              <Loader2 className="h-6 w-6 animate-spin" />
+        <nav className="flex-1 px-4 space-y-2 mt-4">
+          <NavItem icon={<Activity />} label="Dashboard" href="/" />
+          <NavItem icon={<Server />} label="Scans" href="/scans" />
+          <NavItem icon={<Lock />} label="Policies" href="/policies" />
+          <NavItem icon={<FileCode />} label="Reports" href="/reports" />
+        </nav>
+
+        <div className="p-4 border-t border-slate-800">
+          <div className="bg-slate-800/50 rounded-xl p-4">
+            <p className="text-xs text-slate-400 uppercase font-semibold mb-2">System Status</p>
+            <div className="flex items-center gap-2 text-sm text-emerald-400">
+              <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+              API Online
             </div>
-          ) : (
-            policies.map((policy) => (
-              <div 
-                key={policy.id} 
-                className={`p-6 rounded-xl border transition-all ${
-                  policy.enabled 
-                    ? 'bg-slate-900 border-slate-700 shadow-lg' 
-                    : 'bg-slate-900/50 border-slate-800 opacity-75'
-                }`}
-              >
-                <div className="flex justify-between items-start">
-                  <div className="flex gap-4">
-                    <div className={`mt-1 p-2 rounded-lg ${
-                      policy.block_on_failure ? 'bg-rose-500/10 text-rose-500' : 'bg-blue-500/10 text-blue-400'
-                    }`}>
-                      {policy.block_on_failure ? <Lock className="h-5 w-5" /> : <AlertTriangle className="h-5 w-5" />}
-                    </div>
-                    <div>
-                      <h3 className="text-xl font-bold text-white mb-1">{policy.name}</h3>
-                      <p className="text-slate-400 mb-4">{policy.description}</p>
-                      <div className="flex gap-2">
-                        <Badge label={`Threshold: ${policy.severity_threshold}`} color="slate" />
-                        {policy.block_on_failure && <Badge label="Blocks Build" color="rose" />}
+            <div className="flex items-center gap-2 text-sm text-emerald-400 mt-1">
+              <div className="h-2 w-2 rounded-full bg-emerald-400 animate-pulse" />
+              DB Connected
+            </div>
+          </div>
+        </div>
+      </aside>
+
+      <main className="ml-64 p-8">
+        <header className="mb-8">
+          <div className="flex items-center gap-3 mb-2">
+            <div className="p-2 bg-emerald-500/10 rounded-lg border border-emerald-500/20">
+              <ShieldCheck className="h-6 w-6 text-emerald-400" />
+            </div>
+            <h1 className="text-3xl font-bold text-white">Security Policies</h1>
+          </div>
+          <p className="text-slate-400">Configure rules and upload organization standards for the AI Agent.</p>
+        </header>
+
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+          
+          {/* --- LEFT COL: RULES --- */}
+          <div className="lg:col-span-2 space-y-6">
+            <h2 className="text-xl font-semibold text-white flex items-center gap-2">
+              <Lock className="h-5 w-5 text-indigo-400" />
+              Enforcement Rules
+            </h2>
+            
+            {loading ? (
+              <div className="p-12 flex justify-center text-slate-500">
+                <Loader2 className="h-6 w-6 animate-spin" />
+              </div>
+            ) : (
+              policies.map((policy) => (
+                <div 
+                  key={policy.id} 
+                  className={`p-6 rounded-xl border transition-all ${
+                    policy.enabled 
+                      ? 'bg-slate-900 border-slate-700 shadow-lg' 
+                      : 'bg-slate-900/50 border-slate-800 opacity-75'
+                  }`}
+                >
+                  <div className="flex justify-between items-start">
+                    <div className="flex gap-4">
+                      <div className={`mt-1 p-2 rounded-lg ${
+                        policy.block_on_failure ? 'bg-rose-500/10 text-rose-500' : 'bg-blue-500/10 text-blue-400'
+                      }`}>
+                        {policy.block_on_failure ? <Lock className="h-5 w-5" /> : <AlertTriangle className="h-5 w-5" />}
+                      </div>
+                      <div>
+                        <h3 className="text-xl font-bold text-white mb-1">{policy.name}</h3>
+                        <p className="text-slate-400 mb-4">{policy.description}</p>
+                        <div className="flex gap-2">
+                          <Badge label={`Threshold: ${policy.severity_threshold}`} color="slate" />
+                          {policy.block_on_failure && <Badge label="Blocks Build" color="rose" />}
+                        </div>
                       </div>
                     </div>
+
+                    <button 
+                      onClick={() => togglePolicy(policy.id, policy.enabled)}
+                      disabled={savingId === policy.id}
+                      className="focus:outline-none"
+                    >
+                      {savingId === policy.id ? (
+                        <Loader2 className="h-8 w-8 text-slate-500 animate-spin" />
+                      ) : policy.enabled ? (
+                        <ToggleRight className="h-10 w-10 text-emerald-500 hover:text-emerald-400 transition-colors" />
+                      ) : (
+                        <ToggleLeft className="h-10 w-10 text-slate-600 hover:text-slate-500 transition-colors" />
+                      )}
+                    </button>
                   </div>
-
-                  <button 
-                    onClick={() => togglePolicy(policy.id, policy.enabled)}
-                    disabled={savingId === policy.id}
-                    className="focus:outline-none"
-                  >
-                    {savingId === policy.id ? (
-                      <Loader2 className="h-8 w-8 text-slate-500 animate-spin" />
-                    ) : policy.enabled ? (
-                      <ToggleRight className="h-10 w-10 text-emerald-500 hover:text-emerald-400 transition-colors" />
-                    ) : (
-                      <ToggleLeft className="h-10 w-10 text-slate-600 hover:text-slate-500 transition-colors" />
-                    )}
-                  </button>
                 </div>
-              </div>
-            ))
-          )}
-        </div>
+              ))
+            )}
+          </div>
 
-        {/* --- RIGHT COL: KNOWLEDGE BASE --- */}
-        <div className="space-y-6">
-          <h2 className="text-xl font-semibold text-white flex items-center gap-2">
-            <FileText className="h-5 w-5 text-indigo-400" />
-            Knowledge Base
-          </h2>
-          
-          <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-            <p className="text-sm text-slate-400 mb-4">
-              Upload your organization's security policies (PDF or TXT). The AI Agent will use these to tailor its remediation advice.
-            </p>
+          {/* --- RIGHT COL: KNOWLEDGE BASE --- */}
+          <div className="space-y-6">
+            <h2 className="text-xl font-semibold text-white flex items-center gap-2">
+              <FileText className="h-5 w-5 text-indigo-400" />
+              Knowledge Base
+            </h2>
+            
+            <div className="bg-slate-900 border border-slate-800 rounded-xl p-6">
+              <p className="text-sm text-slate-400 mb-4">
+                Upload your organization's security policies (PDF or TXT). The AI Agent will use these to tailor its remediation advice.
+              </p>
 
-            <div className="space-y-3 mb-6">
-              {docs.map((doc) => (
-                <div key={doc.id} className="flex items-center justify-between p-3 bg-slate-950 rounded-lg border border-slate-800 group">
-                  <div className="flex items-center gap-3 overflow-hidden">
-                    <FileText className="h-4 w-4 text-indigo-400 flex-shrink-0" />
-                    <span className="text-sm text-slate-300 truncate">{doc.filename}</span>
+              <div className="space-y-3 mb-6">
+                {docs.map((doc) => (
+                  <div key={doc.id} className="flex items-center justify-between p-3 bg-slate-950 rounded-lg border border-slate-800 group">
+                    <div className="flex items-center gap-3 overflow-hidden">
+                      <FileText className="h-4 w-4 text-indigo-400 flex-shrink-0" />
+                      <span className="text-sm text-slate-300 truncate">{doc.filename}</span>
+                    </div>
+                    <button 
+                      onClick={() => handleDeleteDoc(doc.id)}
+                      className="text-slate-600 hover:text-rose-500 transition-colors p-1"
+                    >
+                      <Trash2 className="h-4 w-4" />
+                    </button>
                   </div>
-                  <button 
-                    onClick={() => handleDeleteDoc(doc.id)}
-                    className="text-slate-600 hover:text-rose-500 transition-colors p-1"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
-                </div>
-              ))}
-              
-              {docs.length === 0 && (
-                <div className="text-center p-4 text-slate-600 text-sm border border-dashed border-slate-800 rounded-lg">
-                  No policies uploaded. AI is using default standards.
-                </div>
-              )}
-            </div>
-
-            <label className={`block w-full cursor-pointer ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
-              <div className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg py-3 flex items-center justify-center gap-2 font-medium transition-colors shadow-lg shadow-indigo-500/20">
-                {uploading ? (
-                  <Loader2 className="h-5 w-5 animate-spin" />
-                ) : (
-                  <Upload className="h-5 w-5" />
+                ))}
+                
+                {docs.length === 0 && (
+                  <div className="text-center p-4 text-slate-600 text-sm border border-dashed border-slate-800 rounded-lg">
+                    No policies uploaded. AI is using default standards.
+                  </div>
                 )}
-                {uploading ? 'Uploading...' : 'Upload Policy Doc'}
               </div>
-              <input 
-                type="file" 
-                accept=".txt,.md,.pdf" 
-                onChange={handleUpload}
-                className="hidden" 
-              />
-            </label>
+
+              <label className={`block w-full cursor-pointer ${uploading ? 'opacity-50 pointer-events-none' : ''}`}>
+                <div className="w-full bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg py-3 flex items-center justify-center gap-2 font-medium transition-colors shadow-lg shadow-indigo-500/20">
+                  {uploading ? (
+                    <Loader2 className="h-5 w-5 animate-spin" />
+                  ) : (
+                    <Upload className="h-5 w-5" />
+                  )}
+                  {uploading ? 'Uploading...' : 'Upload Policy Doc'}
+                </div>
+                <input 
+                  type="file" 
+                  accept=".txt,.md,.pdf" 
+                  onChange={handleUpload}
+                  className="hidden" 
+                />
+              </label>
+            </div>
           </div>
         </div>
-
-      </div>
+      </main>
     </div>
   );
+}
+
+function NavItem({ icon, label, href }: { icon: React.ReactNode, label: string, href: string }) {
+  const pathname = usePathname();
+  const active = pathname === href;
+
+  const content = (
+    <div className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${
+      active
+        ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
+        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+    }`}>
+      {React.cloneElement(icon as React.ReactElement, { size: 18 })}
+      {label}
+    </div>
+  );
+
+  return ( <Link href={href}>{content}</Link> );
 }
 
 function Badge({ label, color }: { label: string, color: 'slate' | 'rose' | 'emerald' }) {
