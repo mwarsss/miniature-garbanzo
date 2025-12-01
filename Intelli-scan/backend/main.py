@@ -4,7 +4,7 @@ import json
 import logging
 import os
 import shutil
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from pydantic import BaseModel
 from git import Repo, GitCommandError
 from typing import Dict, List, Optional
@@ -14,6 +14,8 @@ import google.generativeai as genai
 import psycopg2
 from psycopg2.extras import RealDictCursor
 import datetime
+from pypdf import PdfReader
+import io
 
 # --- Basic Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -91,41 +93,85 @@ class ScanStatus(BaseModel):
 # --- Database Table Creation (on startup) ---
 @app.on_event("startup")
 def startup_event():
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS scans (
-                id SERIAL PRIMARY KEY,
-                uuid UUID UNIQUE NOT NULL,
-                repo_url VARCHAR(255) NOT NULL,
-                status VARCHAR(50) NOT NULL,
-                submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                finished_at TIMESTAMPTZ,
-                sca_result JSONB,
-                sast_result JSONB,
-                ai_analysis JSONB
-            );
-        """)
-        conn.commit()
-        cur.close()
-        conn.close()
-        logging.info("Database table 'scans' is ready.")
-    except Exception as e:
-        logging.error(f"Failed to create database table: {e}")
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    # Scans table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS scans (
+            id SERIAL PRIMARY KEY,
+            uuid UUID UNIQUE NOT NULL,
+            repo_url VARCHAR(255) NOT NULL,
+            status VARCHAR(50) NOT NULL,
+            submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            finished_at TIMESTAMPTZ,
+            sca_result JSONB,
+            sast_result JSONB,
+            ai_analysis JSONB
+        );
+    """)
+    logging.info("Database table 'scans' is ready.")
+
+    # Policy documents table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS policy_documents (
+            id SERIAL PRIMARY KEY,
+            filename VARCHAR(255) NOT NULL,
+            content TEXT NOT NULL,
+            uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    logging.info("Database table 'policy_documents' is ready.")
+
+    conn.commit()
+    cur.close()
+    conn.close()
 
 # --- AI Helper Functions ---
-async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[AIAnalysisResult]:
-    # ... (implementation remains the same, but check for model)
-    if not model: return None
-    # ... same prompt and logic
+def get_policy_context() -> str:
+    """Retrieves all policy documents from the database to form a context string."""
     try:
-        prompt = f"""
-        Analyze the following security scan results...
-        SCA Results: {json.dumps(sca_result, indent=2)}
-        SAST Results: {json.dumps(sast_result, indent=2)}
-        ...
-        """
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT filename, content FROM policy_documents ORDER BY uploaded_at DESC")
+        policies = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        if not policies:
+            return "No security policies provided."
+
+        context = "### Internal Security Policies ###\n\n"
+        for policy in policies:
+            context += f"--- Document: {policy['filename']} ---\n"
+            context += f"{policy['content']}\n\n"
+        return context
+    except Exception as e:
+        logging.error(f"Could not retrieve policy context: {e}")
+        return "Error retrieving security policies."
+
+async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[AIAnalysisResult]:
+    if not model: return None
+    
+    policy_context = get_policy_context()
+    prompt = f"""
+    As an expert security analyst, analyze the following scan results.
+    Your response MUST be contextualized by the internal security policies provided.
+    Instead of generic advice, reference specific policy documents or sections where applicable.
+
+    {policy_context}
+
+    ### Security Scan Results ###
+    SCA Results: {json.dumps(sca_result, indent=2)}
+    SAST Results: {json.dumps(sast_result, indent=2)}
+
+    Generate a JSON response with an executive summary and the top 3 vulnerabilities,
+    linking them to the policies. For example, if a policy requires MFA, and a finding
+    relates to weak authentication, your POC should mention the specific policy.
+    
+    Format your response as a single JSON object.
+    """
+    try:
         response = await model.generate_content_async(prompt)
         parsed_output = json.loads(response.text.strip())
         return AIAnalysisResult(**parsed_output)
@@ -135,17 +181,26 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[
 
 
 async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[RemediationResult]:
-    # ... (implementation remains the same, but check for model)
     if not model: return None
-    # ... same prompt and logic
+    
+    policy_context = get_policy_context()
+    prompt = f"""
+    As a senior software security engineer, create a remediation plan based on the scan results.
+    Your fixes and explanations MUST align with the provided internal security policies.
+    Reference the policies to justify your proposed code changes.
+
+    {policy_context}
+
+    ### Security Scan Results ###
+    SCA Results: {json.dumps(sca_result, indent=2)}
+    SAST Results: {json.dumps(sast_result, indent=2)}
+
+    Generate a JSON object containing a list of remediation steps. Each step must include
+    the issue, the exact code fix, and an explanation that references the relevant internal policy.
+
+    Format your response as a single JSON object.
+    """
     try:
-        prompt = f"""
-        You are a senior software security engineer...
-        Scan Data:
-        SCA Results: {json.dumps(sca_result, indent=2)}
-        SAST Results: {json.dumps(sast_result, indent=2)}
-        ...
-        """
         response = await model.generate_content_async(prompt)
         parsed_output = json.loads(response.text.strip())
         return RemediationResult(**parsed_output)
@@ -187,7 +242,6 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
         except GitCommandError as e:
             logging.error(f"[{scan_uuid}] Git clone error: {e}")
             update_status("failed")
-            # In a real app, you might store the error message in the DB
             return
 
         sca_result = _run_trivy_scan(temp_dir)
@@ -235,7 +289,6 @@ async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
 @app.get("/scan/{scan_id}", response_model=ScanStatus)
 async def get_scan_status(scan_id: str):
     conn = get_db_connection()
-    # Use RealDictCursor to get results as dictionaries
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT status, sca_result, sast_result, ai_analysis FROM scans WHERE uuid = %s", (scan_id,))
     scan = cur.fetchone()
@@ -269,7 +322,6 @@ def list_scans(limit: int = 50):
         scans = cur.fetchall()
         cur.close()
         conn.close()
-        # Ensure datetimes are serialized to strings
         for scan in scans:
             if scan.get('submit_time'):
                 scan['submit_time'] = scan['submit_time'].isoformat()
@@ -282,7 +334,6 @@ def list_scans(limit: int = 50):
 
 @app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
 async def get_remediation_plan(scan_id: str):
-    # ... (this endpoint can remain similar, just fetching from DB)
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE uuid = %s", (scan_id,))
@@ -299,3 +350,43 @@ async def get_remediation_plan(scan_id: str):
     if not remediation_plan:
         raise HTTPException(status_code=500, detail="Failed to generate remediation plan.")
     return remediation_plan
+
+@app.post("/policies")
+async def upload_policy_document(file: UploadFile = File(...)):
+    """Uploads a policy document (PDF or TXT) and stores its content."""
+    filename = file.filename
+    content = ""
+    
+    try:
+        if filename.lower().endswith(".pdf"):
+            pdf_content = await file.read()
+            pdf_file = io.BytesIO(pdf_content)
+            reader = PdfReader(pdf_file)
+            for page in reader.pages:
+                content += page.extract_text()
+        elif filename.lower().endswith(".txt"):
+            content_bytes = await file.read()
+            content = content_bytes.decode("utf-8")
+        else:
+            raise HTTPException(status_code=400, detail="Unsupported file type. Please upload a PDF or TXT file.")
+        
+        if not content.strip():
+            raise HTTPException(status_code=400, detail="The uploaded document is empty or could not be read.")
+
+        conn = get_db_connection()
+        cur = conn.cursor()
+        # Simple approach: replace the document if it already exists to avoid duplicates
+        cur.execute("DELETE FROM policy_documents WHERE filename = %s", (filename,))
+        cur.execute(
+            "INSERT INTO policy_documents (filename, content) VALUES (%s, %s)",
+            (filename, content)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return {"status": "success", "filename": filename, "chars_read": len(content)}
+    
+    except Exception as e:
+        logging.error(f"Failed to upload or process policy document '{filename}': {e}")
+        raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
