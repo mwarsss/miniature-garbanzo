@@ -162,7 +162,6 @@ export default function Dashboard() {
         <nav className="flex-1 px-4 space-y-2 mt-4">
           <NavItem icon={<Activity />} label="Dashboard" href="/" />
           <NavItem icon={<Server />} label="Scans" href="/scans" />
-          <NavItem icon={<Lock />} label="Policies" href="/policies" />
           <NavItem icon={<FileCode />} label="Reports" href="/reports" />
         </nav>
 
