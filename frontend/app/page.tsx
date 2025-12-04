@@ -163,6 +163,7 @@ export default function Dashboard() {
           <NavItem icon={<Activity />} label="Dashboard" href="/" />
           <NavItem icon={<Server />} label="Scans" href="/scans" />
           <NavItem icon={<Lock />} label="Policies" href="/policies" />
+
           <NavItem icon={<FileCode />} label="Reports" href="/reports" />
         </nav>
 

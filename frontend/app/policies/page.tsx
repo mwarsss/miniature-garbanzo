@@ -148,7 +148,8 @@ export default function PoliciesPage() {
           <NavItem icon={<Activity />} label="Dashboard" href="/" />
           <NavItem icon={<Server />} label="Scans" href="/scans" />
           <NavItem icon={<Lock />} label="Policies" href="/policies" />
-          <NavItem icon={<FileCode />} label="Reports" href="/reports" />
+              <NavItem icon={<FileText />} label="Reports" href="/reports" />
+
         </nav>
 
         <div className="p-4 border-t border-slate-800">

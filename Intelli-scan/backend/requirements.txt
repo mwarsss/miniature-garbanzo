@@ -3,3 +3,4 @@ pypdf
 fastapi
 uvicorn
 python-dotenv
+GitPython

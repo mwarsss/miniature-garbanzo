@@ -5,7 +5,7 @@ import logging
 import os
 import shutil
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from git import Repo, GitCommandError
 from typing import Dict, List, Optional
 import uuid
@@ -90,6 +90,21 @@ class ScanStatus(BaseModel):
     message: Optional[str] = None
     result: Optional[ScanResultData] = None
 
+class ReportRequest(BaseModel):
+    scan_id: int
+    format: str = Field("markdown", description="The desired report format.")
+
+class ReportResponse(BaseModel):
+    report_content: str
+    filename: str
+
+class ReportInfo(BaseModel):
+    id: int
+    scan_id: int
+    filename: str
+    format: str
+    generated_at: datetime.datetime
+
 # --- Database Table Creation (on startup) ---
 @app.on_event("startup")
 def startup_event():
@@ -122,6 +137,19 @@ def startup_event():
         );
     """)
     logging.info("Database table 'policy_documents' is ready.")
+
+    # Reports table
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS reports (
+            id SERIAL PRIMARY KEY,
+            scan_id INTEGER REFERENCES scans(id) ON DELETE CASCADE,
+            format VARCHAR(50) NOT NULL,
+            filename VARCHAR(255) NOT NULL,
+            content TEXT NOT NULL,
+            generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+    """)
+    logging.info("Database table 'reports' is ready.")
 
     conn.commit()
     cur.close()
@@ -224,6 +252,77 @@ def _run_semgrep_scan(directory: str) -> dict:
         return json.loads(process.stdout) if process.stdout else {"error": process.stderr}
     except Exception as e:
         return {"error": str(e)}
+
+# --- Report Generation Helper ---
+def generate_markdown_report(scan: dict) -> str:
+    """Generates a Markdown report from completed scan data."""
+    repo_url = scan.get('repo_url', 'N/A')
+    finished_at = scan.get('finished_at', 'N/A')
+    
+    content = f"# Security Scan Report for {repo_url}\n\n"
+    content += f"**Scan completed on:** {finished_at}\n\n"
+    content += "---\n\n"
+
+    # AI Analysis Section
+    ai_analysis = scan.get('ai_analysis')
+    if ai_analysis:
+        content += "##  Inteligencia Artificial (IA) Security Analyst Summary\n\n"
+        content += f"**Executive Summary:** {ai_analysis.get('summary', 'Not available.')}\n\n"
+        content += "### Top Vulnerabilities Identified:\n\n"
+        
+        vulns = ai_analysis.get('top_vulnerabilities', [])
+        if vulns:
+            content += "| Severity | Vulnerability | File Location | Proof of Concept |\n"
+            content += "|----------|---------------|---------------|------------------|\n"
+            for v in vulns:
+                content += f"| {v.get('severity', 'N/A')} | {v.get('name', 'N/A')} | `{v.get('file', 'N/A')}` | `{v.get('poc', 'N/A')}` |\n"
+            content += "\n"
+        else:
+            content += "No major vulnerabilities highlighted by the AI analyst.\n\n"
+    
+    # SAST Results Section
+    sast_results = scan.get('sast_result', {}).get('results', [])
+    content += "---\n\n## SAST (Static Analysis) Results\n\n"
+    if sast_results:
+        content += f"Found **{len(sast_results)}** potential issues.\n\n"
+        content += "| Severity | Rule ID | File:Line | Message |\n"
+        content += "|----------|---------|-----------|---------|\n"
+        for finding in sast_results:
+            extra = finding.get('extra', {})
+            severity = extra.get('severity', 'INFO')
+            message = extra.get('message', '').replace('\n', ' ')
+            path = finding.get('path', 'N/A')
+            line = finding.get('start', {}).get('line', 'N/A')
+            check_id = finding.get('check_id', 'N/A')
+            content += f"| {severity} | {check_id} | `{path}:{line}` | {message} |\n"
+        content += "\n"
+    else:
+        content += "No SAST findings.\n\n"
+
+    # SCA Results Section
+    sca_results = scan.get('sca_result', {}).get('Results', [])
+    content += "---\n\n## SCA (Dependency) Results\n\n"
+    if sca_results:
+        total_vulns = 0
+        for res in sca_results:
+            total_vulns += len(res.get('Vulnerabilities', []))
+        content += f"Found **{total_vulns}** potential vulnerabilities in dependencies.\n\n"
+        
+        for res in sca_results:
+            target = res.get('Target')
+            vulns = res.get('Vulnerabilities', [])
+            if not vulns: continue
+            
+            content += f"### Target: `{target}`\n\n"
+            content += "| Severity | Package | Version | Vulnerability ID | Title |\n"
+            content += "|----------|---------|---------|------------------|-------|\n"
+            for v in vulns:
+                content += f"| {v.get('Severity', 'N/A')} | {v.get('PkgName', 'N/A')} | {v.get('InstalledVersion', 'N/A')} | `{v.get('VulnerabilityID', 'N/A')}` | {v.get('Title', 'N/A')} |\n"
+            content += "\n"
+    else:
+        content += "No SCA findings.\n\n"
+        
+    return content
 
 # --- Background Scan Task ---
 async def _perform_scan(scan_uuid: str, repo_url: str):
@@ -390,3 +489,71 @@ async def upload_policy_document(file: UploadFile = File(...)):
     except Exception as e:
         logging.error(f"Failed to upload or process policy document '{filename}': {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+
+# --- Report Endpoints ---
+@app.post("/reports/generate", response_model=ReportResponse)
+def generate_report(request: ReportRequest):
+    """Generates a new report for a completed scan."""
+    if request.format != 'markdown':
+        raise HTTPException(status_code=400, detail="Unsupported format. Only 'markdown' is available.")
+
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM scans WHERE id = %s", (request.scan_id,))
+        scan = cur.fetchone()
+        
+        if not scan:
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Scan ID not found.")
+        
+        if scan['status'] != 'completed':
+            cur.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Cannot generate report for a scan that is not completed.")
+
+        report_content = generate_markdown_report(scan)
+        
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"report_scan_{request.scan_id}_{timestamp}.md"
+
+        # Save report to the database
+        cur.execute(
+            """
+            INSERT INTO reports (scan_id, format, filename, content)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (request.scan_id, request.format, filename, report_content)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+        return ReportResponse(report_content=report_content, filename=filename)
+
+    except HTTPException as e:
+        raise e  # Re-raise HTTPException to preserve status code and detail
+    except Exception as e:
+        logging.error(f"Failed to generate report for scan_id {request.scan_id}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to generate report.")
+
+@app.get("/reports", response_model=List[ReportInfo])
+def list_reports(limit: int = 50):
+    """Lists previously generated reports."""
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("""
+            SELECT id, scan_id, filename, format, generated_at
+            FROM reports
+            ORDER BY generated_at DESC
+            LIMIT %s
+        """, (limit,))
+        reports = cur.fetchall()
+        cur.close()
+        conn.close()
+        return reports
+    except Exception as e:
+        logging.error(f"Database error in /reports: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")

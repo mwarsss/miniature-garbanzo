@@ -18,7 +18,8 @@ import {
   Shield,
   Activity,
   Lock,
-  FileCode
+  FileCode,
+  FileText
 } from 'lucide-react';
 
 // --- Types ---
@@ -98,7 +99,7 @@ export default function ScansPage() {
           <NavItem icon={<Activity />} label="Dashboard" href="/" />
           <NavItem icon={<Server />} label="Scans" href="/scans" />
           <NavItem icon={<Lock />} label="Policies" href="/policies" />
-          <NavItem icon={<FileCode />} label="Reports" href="/reports" />
+              <NavItem icon={<FileText />} label="Reports" href="/reports" />
         </nav>
 
         <div className="p-4 border-t border-slate-800">
