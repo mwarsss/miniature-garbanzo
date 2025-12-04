@@ -1,2 +1,5 @@
 python-multipart
 pypdf
+fastapi
+uvicorn
+python-dotenv
