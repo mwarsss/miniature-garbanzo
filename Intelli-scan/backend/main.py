@@ -238,19 +238,54 @@ async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Option
 
 # --- Scanner Helper Functions ---
 def _run_trivy_scan(directory: str) -> dict:
-    # ... (implementation remains the same)
+    """Runs Trivy filesystem scan with optimizations."""
     try:
-        process = subprocess.run([TRIVY_PATH, "fs", "--format", "json", "--quiet", directory], capture_output=True, text=True, check=False)
-        return json.loads(process.stdout) if process.stdout and process.returncode == 0 else {"error": process.stderr}
+        logging.info(f"[{datetime.datetime.now()}] Running Trivy scan in {directory}...")
+        trivy_cmd = [
+            TRIVY_PATH, "fs", directory,
+            "--format", "json",
+            "--quiet",
+            "--timeout", "15m",
+            "--skip-dirs", os.path.join(directory, "node_modules"),
+            "--skip-dirs", os.path.join(directory, ".git"),
+        ]
+        process = subprocess.run(trivy_cmd, capture_output=True, text=True, check=False)
+
+        if process.returncode != 0:
+            logging.error(f"Trivy scan failed. Stderr: {process.stderr}")
+            # Try to parse stdout anyway, it might contain partial results
+            try:
+                return json.loads(process.stdout) if process.stdout else {"error": f"Trivy scan failed. Stderr: {process.stderr}"}
+            except json.JSONDecodeError:
+                return {"error": f"Trivy scan failed and output was not valid JSON. Stderr: {process.stderr}"}
+        
+        return json.loads(process.stdout) if process.stdout else {}
     except Exception as e:
+        logging.error(f"Exception during Trivy scan: {e}")
         return {"error": str(e)}
 
 def _run_semgrep_scan(directory: str) -> dict:
-    # ... (implementation remains the same)
+    """Runs Semgrep scan with optimizations."""
     try:
-        process = subprocess.run([SEMGREP_PATH, "--config", "p/security-audit", "--json", directory], capture_output=True, text=True, check=False)
-        return json.loads(process.stdout) if process.stdout else {"error": process.stderr}
+        logging.info(f"[{datetime.datetime.now()}] Running Semgrep scan in {directory}...")
+        semgrep_cmd = [
+            SEMGREP_PATH, "scan",
+            "--config=p/security-audit",
+            "--json",
+            "--timeout", "5",
+            "--jobs", "2",
+            "--exclude", "*.min.js",
+            "--exclude", "package-lock.json",
+            directory
+        ]
+        process = subprocess.run(semgrep_cmd, capture_output=True, text=True, check=False)
+
+        if process.returncode != 0:
+            logging.error(f"Semgrep scan failed. Stderr: {process.stderr}")
+
+        return json.loads(process.stdout) if process.stdout else {"error": process.stderr or "Semgrep returned no output."}
     except Exception as e:
+        logging.error(f"Exception during Semgrep scan: {e}")
         return {"error": str(e)}
 
 # --- Report Generation Helper ---
