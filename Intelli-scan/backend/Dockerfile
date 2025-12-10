@@ -26,6 +26,9 @@ FROM python:3.11-slim
 # Set the working directory
 WORKDIR /app
 
+# Install git
+RUN apt-get update && apt-get install -y git --no-install-recommends
+
 # Copy trivy and semgrep from the builder stage
 COPY --from=builder /usr/local/bin/trivy /usr/local/bin/trivy
 COPY --from=builder /usr/local/bin/semgrep /usr/local/bin/semgrep
