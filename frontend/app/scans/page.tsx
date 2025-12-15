@@ -25,11 +25,27 @@ import {
 // --- Types ---
 interface Scan {
   id: number;
+  uuid: string; // Added uuid
   repo_url: string;
   status: 'queued' | 'processing' | 'completed' | 'failed';
   submit_time: string;
   finished_at?: string;
-  scan_data?: any; // We don't need full data for the list view
+  sca_result?: any;
+  sast_result?: any;
+  ai_analysis?: any;
+}
+
+interface ScanDetail {
+  status: string;
+  message?: string;
+  result?: {
+    sca?: any;
+    sast?: any;
+    ai_analysis?: {
+      summary: string;
+      top_vulnerabilities: { name: string; severity: string; file: string; poc: string; }[];
+    };
+  };
 }
 
 // Helper for relative time (e.g., "2 hours ago")
@@ -52,6 +68,12 @@ export default function ScansPage() {
   const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
   const [statusFilter, setStatusFilter] = useState('all');
+
+  const [showDetailModal, setShowDetailModal] = useState(false);
+  const [selectedScanUuid, setSelectedScanUuid] = useState<string | null>(null);
+  const [detailedScanData, setDetailedScanData] = useState<ScanDetail | null>(null);
+  const [loadingDetail, setLoadingDetail] = useState(false);
+  const [detailError, setDetailError] = useState<string | null>(null);
 
   // Fetch scans from Backend
     useEffect(() => {
@@ -76,6 +98,32 @@ export default function ScansPage() {
   
       fetchScans();
     }, []);
+
+  const fetchScanDetails = async (uuid: string) => {
+    setLoadingDetail(true);
+    setShowDetailModal(true);
+    setDetailedScanData(null);
+    setDetailError(null);
+    try {
+      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${uuid}`);
+      if (res.ok) {
+        const data = await res.json();
+        setDetailedScanData(data);
+      } else {
+        const errorData = await res.json();
+        const errorMessage = errorData.detail || "Failed to load scan details.";
+        console.error("Failed to fetch scan details:", errorMessage);
+        setDetailError(errorMessage);
+      }
+    } catch (error) {
+      const errorMessage = "An error occurred while fetching scan details.";
+      console.error("Failed to fetch scan details:", error);
+      setDetailError(errorMessage);
+    } finally {
+      setLoadingDetail(false);
+    }
+  };
+
   // Filter Logic
   const filteredScans = scans.filter(scan => {
     const matchesSearch = scan.repo_url.toLowerCase().includes(searchTerm.toLowerCase());
@@ -195,7 +243,11 @@ export default function ScansPage() {
                 </tr>
               ) : (
                 filteredScans.map((scan) => (
-                  <tr key={scan.id} className="hover:bg-slate-800/50 transition-colors group">
+                  <tr 
+                    key={scan.id} 
+                    className="hover:bg-slate-800/50 transition-colors group cursor-pointer"
+                    onClick={() => fetchScanDetails(scan.uuid)} // Make row clickable
+                  >
                     <td className="p-4 text-slate-500 font-mono text-sm">#{scan.id}</td>
                     <td className="p-4">
                       <div className="flex items-center gap-2 text-indigo-300 font-medium">
@@ -233,6 +285,85 @@ export default function ScansPage() {
           </div>
         </div>
       </main>
+
+      {/* Scan Detail Modal */}
+      {showDetailModal && (
+        <div className="fixed inset-0 bg-slate-900 bg-opacity-75 flex items-center justify-center p-4 z-50">
+          <div className="bg-slate-800 border border-slate-700 rounded-xl shadow-2xl w-full max-w-3xl max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b border-slate-700 flex justify-between items-center">
+              <h3 className="text-xl font-bold text-white">Scan Details</h3>
+              <button 
+                onClick={() => setShowDetailModal(false)}
+                className="text-slate-400 hover:text-white"
+              >
+                &times;
+              </button>
+            </div>
+            <div className="p-6">
+              {loadingDetail ? (
+                <div className="flex flex-col items-center justify-center p-10">
+                  <Loader2 className="h-8 w-8 text-indigo-400 animate-spin mb-4" />
+                  <p className="text-indigo-300">Loading scan details...</p>
+                </div>
+              ) : detailError ? (
+                <div className="p-10 text-center text-rose-400">
+                  <p>Error: {detailError}</p>
+                </div>
+              ) : detailedScanData && detailedScanData.result ? (
+                <>
+                  <div className="mb-6">
+                    <p className="text-lg font-semibold text-white mb-2">AI Analysis Summary:</p>
+                    <p className="text-slate-300 text-sm">
+                      {detailedScanData.result.ai_analysis?.summary || "No AI summary available."}
+                    </p>
+                  </div>
+
+                  {detailedScanData.result.ai_analysis?.top_vulnerabilities && detailedScanData.result.ai_analysis.top_vulnerabilities.length > 0 && (
+                    <div className="mb-6">
+                      <p className="text-lg font-semibold text-white mb-2">Top Vulnerabilities (AI):</p>
+                      <div className="space-y-2">
+                        {detailedScanData.result.ai_analysis.top_vulnerabilities.map((v, i) => (
+                          <div key={i} className="bg-slate-900 p-3 rounded border border-slate-700">
+                            <p className="font-medium text-red-300">{v.name} - <span className="text-slate-400">Severity: {v.severity}</span></p>
+                            <p className="text-xs text-slate-500">File: {v.file}</p>
+                            <p className="text-xs text-slate-500">PoC: {v.poc}</p>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {detailedScanData.result.sast?.results && detailedScanData.result.sast.results.length > 0 && (
+                    <div className="mb-6">
+                      <p className="text-lg font-semibold text-white mb-2">SAST Findings:</p>
+                      <p className="text-slate-300 text-sm">
+                        Found {detailedScanData.result.sast.results.length} SAST issues.
+                      </p>
+                    </div>
+                  )}
+
+                  {detailedScanData.result.sca?.Results && detailedScanData.result.sca.Results.length > 0 && (
+                    <div className="mb-6">
+                      <p className="text-lg font-semibold text-white mb-2">SCA Findings:</p>
+                      <p className="text-slate-300 text-sm">
+                        Found {detailedScanData.result.sca.Results.reduce((acc: number, res: any) => acc + (res.Vulnerabilities?.length || 0), 0)} SCA vulnerabilities.
+                      </p>
+                    </div>
+                  )}
+
+                  {!detailedScanData.result.ai_analysis && !detailedScanData.result.sast?.results && !detailedScanData.result.sca?.Results && (
+                    <p className="text-slate-500">No detailed findings available for this scan.</p>
+                  )}
+                </>
+              ) : (
+                <div className="p-10 text-center text-slate-500">
+                  No data available for this scan. This may be because the scan is still in progress or failed.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

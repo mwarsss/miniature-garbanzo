@@ -2,6 +2,7 @@
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
+
 import { usePathname } from 'next/navigation';
 import {
   FileText,
@@ -13,6 +14,7 @@ import {
   Server,
   Lock,
   History,
+  AlertTriangle, // Import alert icon
 } from 'lucide-react';
 
 // --- Types ---
@@ -30,13 +32,26 @@ interface PastReport {
   generated_at: string;
 }
 
+interface RemediationDetail {
+  issue: string;
+  fix_code: string;
+  explanation: string;
+}
+
+interface RemediationResult {
+  remediations: RemediationDetail[];
+}
+
 export default function ReportsPage() {
   const [scans, setScans] = useState<ScanOption[]>([]);
   const [pastReports, setPastReports] = useState<PastReport[]>([]);
   const [selectedScan, setSelectedScan] = useState<string>("");
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [remediating, setRemediating] = useState(false);
   const [report, setReport] = useState<{content: string, filename: string} | null>(null);
+  const [remediationPlan, setRemediationPlan] = useState<RemediationResult | null>(null);
+  const [error, setError] = useState<string | null>(null); // State for error messages
 
   // --- Data Fetching ---
   useEffect(() => {
@@ -66,6 +81,7 @@ export default function ReportsPage() {
 
       } catch (error) {
         console.error("Backend unavailable:", error);
+        setError("Backend is currently unavailable. Please try again later.");
         setScans([]);
         setPastReports([]);
       } finally {
@@ -81,6 +97,7 @@ export default function ReportsPage() {
     if (!selectedScan) return;
     setGenerating(true);
     setReport(null);
+    setError(null);
 
     try {
       const res = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/reports/generate', {
@@ -92,20 +109,43 @@ export default function ReportsPage() {
       if (res.ok) {
         const data = await res.json();
         setReport({ content: data.report_content, filename: data.filename });
-        // Refresh past reports list
         const reportsRes = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/reports?limit=10');
         if (reportsRes.ok) setPastReports(await reportsRes.json());
-
       } else {
         const errorData = await res.json();
-        console.error("Failed to generate report:", errorData.detail);
-        alert(`Error: ${errorData.detail}`); // Simple user feedback
+        const errorMessage = errorData.detail || "An unknown error occurred.";
+        console.error("Failed to generate report:", errorMessage);
+        setError(`Error generating report: ${errorMessage}`);
       }
     } catch (error) {
         console.error(error);
-        alert("An unexpected error occurred while generating the report.");
+        setError("An unexpected error occurred while generating the report.");
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const handleRemediation = async () => {
+    setRemediating(true);
+    setRemediationPlan(null);
+    setError(null);
+    try {
+      const res = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/trivy_remediation');
+      if (res.ok) {
+        const data = await res.json();
+        setRemediationPlan(data);
+      } else {
+        const errorData = await res.json();
+        const errorMessage = errorData.detail || "An unknown error occurred.";
+        console.error("Failed to get remediation plan:", errorMessage);
+        setError(`Error generating remediation: ${errorMessage}`);
+      }
+    } catch (error) {
+      console.error("Remediation fetch error:", error);
+      setError("An unexpected error occurred while fetching the remediation plan.");
+    }
+    finally {
+      setRemediating(false);
     }
   };
 
@@ -163,7 +203,7 @@ export default function ReportsPage() {
             </div>
             <h1 className="text-3xl font-bold text-white">Reports Center</h1>
           </div>
-          <p className="text-slate-400">Generate and download compliance reports for your scans.</p>
+          <p className="text-slate-400">Generate compliance reports and get AI-powered remediation advice.</p>
         </header>
 
         <div className="grid grid-cols-1 lg:grid-cols-3 gap-8 items-start">
@@ -190,18 +230,33 @@ export default function ReportsPage() {
                     <div className="absolute right-4 top-3.5 pointer-events-none text-slate-500">▼</div>
                 </div>
             </div>
-
-            <button 
-                onClick={handleGenerate}
-                disabled={!selectedScan || generating}
-                className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${ 
-                    !selectedScan || generating
-                    ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                    : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
-                }`}
-            >
-                {generating ? <><Loader2 className="h-5 w-5 animate-spin" />Generating...</> : <><FileText className="h-5 w-5" />Generate Report</>}
-            </button>
+            
+            <div className="flex gap-4">
+              <button 
+                  onClick={handleGenerate}
+                  disabled={!selectedScan || generating}
+                  className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${ 
+                      !selectedScan || generating
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+                  }`}
+              >
+                  {generating ? <><Loader2 className="h-5 w-5 animate-spin" />Generating...</> : <><FileText className="h-5 w-5" />Generate Report</>}
+              </button>
+              <button 
+                  onClick={handleRemediation}
+                  disabled={remediating}
+                  className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${ 
+                      remediating
+                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                      : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+                  }`}
+              >
+                  {remediating ? <><Loader2 className="h-5 w-5 animate-spin" />Analyzing...</> : <><Shield className="h-5 w-5" />Get AI Remediation</>}
+              </button>
+            </div>
+            
+            {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
 
             {report && (
                 <div className="mt-8 p-4 bg-emerald-900/10 border border-emerald-900/30 rounded-lg animate-in fade-in slide-in-from-bottom-4">
@@ -221,6 +276,25 @@ export default function ReportsPage() {
                     </button>
                 </div>
             )}
+            
+            {remediationPlan && (
+              <div className="mt-8 animate-in fade-in slide-in-from-bottom-4">
+                <h3 className="text-xl font-bold text-white mb-4">Top 3 AI Remediation Steps</h3>
+                <div className="space-y-6">
+                  {remediationPlan.remediations.map((item, index) => (
+                    <div key={index} className="bg-slate-900 border border-slate-800 rounded-xl p-6">
+                      <h4 className="font-bold text-lg text-indigo-400 mb-2">{index + 1}. {item.issue}</h4>
+                      <p className="text-sm text-slate-300 mb-4">{item.explanation}</p>
+                      <p className="text-xs text-slate-400 uppercase font-semibold mb-2">Suggested Fix:</p>
+                      <code className="block w-full bg-slate-950 p-4 rounded-lg text-sm text-slate-200 border border-slate-700 whitespace-pre-wrap font-mono">
+                        {item.fix_code}
+                      </code>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
           </div>
 
           {/* --- Past Reports Section --- */}
@@ -241,8 +315,6 @@ export default function ReportsPage() {
                     </div>
                     <button 
                       onClick={async () => {
-                        // This is inefficient as it re-generates, but simple for now.
-                        // A better approach would be a GET /reports/{id}/download endpoint.
                         setSelectedScan(pr.scan_id.toString());
                         await handleGenerate();
                       }}
@@ -283,4 +355,17 @@ function NavItem({ icon, label, href }: { icon: React.ReactNode, label: string, 
   );
 
   return ( <Link href={href}>{content}</Link> );
+}
+
+// --- Subcomponent: Error Display ---
+function ErrorDisplay({ message, onClose }: { message: string, onClose: () => void }) {
+  return (
+    <div className="mt-6 p-4 bg-rose-900/20 border border-rose-500/30 rounded-lg flex items-center justify-between animate-in fade-in">
+      <div className="flex items-center gap-3">
+        <AlertTriangle className="h-5 w-5 text-rose-400" />
+        <p className="font-medium text-rose-300">{message}</p>
+      </div>
+      <button onClick={onClose} className="text-rose-400 hover:text-white">&times;</button>
+    </div>
+  )
 }
