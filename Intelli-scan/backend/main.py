@@ -53,7 +53,7 @@ app.add_middleware(
 # --- Google Generative AI Configuration ---
 if GOOGLE_API_KEY:
     genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel('gemini-pro')
+    model = genai.GenerativeModel('gemini-1.0-pro')
 else:
     logging.warning("GOOGLE_API_KEY not set. AI features will be disabled.")
     model = None
@@ -229,7 +229,9 @@ async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Option
     Format your response as a single JSON object.
     """
     try:
+        logging.info(f"AI remediation prompt: {prompt}")
         response = await model.generate_content_async(prompt)
+        logging.info(f"AI remediation response: {response.text}")
         parsed_output = json.loads(response.text.strip())
         return RemediationResult(**parsed_output)
     except Exception as e:
@@ -471,6 +473,9 @@ def list_scans(limit: int = 50):
 
 @app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
 async def get_remediation_plan(scan_id: str):
+    if not model:
+        raise HTTPException(status_code=500, detail="AI model is not configured. GOOGLE_API_KEY may be missing.")
+        
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
     cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE uuid = %s", (scan_id,))

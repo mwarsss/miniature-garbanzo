@@ -25,7 +25,6 @@ import {
 // --- Types ---
 interface Scan {
   id: number;
-  uuid: string; // Added uuid
   repo_url: string;
   status: 'queued' | 'processing' | 'completed' | 'failed';
   submit_time: string;
@@ -99,13 +98,13 @@ export default function ScansPage() {
       fetchScans();
     }, []);
 
-  const fetchScanDetails = async (uuid: string) => {
+  const fetchScanDetails = async (id: string) => {
     setLoadingDetail(true);
     setShowDetailModal(true);
     setDetailedScanData(null);
     setDetailError(null);
     try {
-      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${uuid}`);
+      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${id}`);
       if (res.ok) {
         const data = await res.json();
         setDetailedScanData(data);
@@ -246,7 +245,7 @@ export default function ScansPage() {
                   <tr 
                     key={scan.id} 
                     className="hover:bg-slate-800/50 transition-colors group cursor-pointer"
-                    onClick={() => fetchScanDetails(scan.uuid)} // Make row clickable
+                    onClick={() => fetchScanDetails(scan.id.toString())} // Make row clickable
                   >
                     <td className="p-4 text-slate-500 font-mono text-sm">#{scan.id}</td>
                     <td className="p-4">

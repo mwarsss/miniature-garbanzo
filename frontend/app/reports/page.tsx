@@ -126,11 +126,16 @@ export default function ReportsPage() {
   };
 
   const handleRemediation = async () => {
+    if (!selectedScan) {
+      setError("Please select a scan before getting a remediation plan.");
+      return;
+    }
     setRemediating(true);
     setRemediationPlan(null);
     setError(null);
     try {
-      const res = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/trivy_remediation');
+      console.log("Fetching remediation for scan ID:", selectedScan);
+      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${selectedScan}/remediation`);
       if (res.ok) {
         const data = await res.json();
         setRemediationPlan(data);
