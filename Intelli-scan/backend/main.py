@@ -422,55 +422,6 @@ async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(_perform_scan, str(scan_uuid), request.repo_url)
     return {"scan_id": str(scan_uuid), "status": "queued"}
 
-@app.get("/scan/{scan_id}", response_model=ScanStatus)
-async def get_scan_status(scan_id: str):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT status, sca_result, sast_result, ai_analysis FROM scans WHERE uuid = %s", (scan_id,))
-    scan = cur.fetchone()
-    cur.close()
-    conn.close()
-
-    if not scan:
-        raise HTTPException(status_code=404, detail="Scan ID not found.")
-
-    return ScanStatus(
-        status=scan['status'],
-        result=ScanResultData(
-            sca=scan['sca_result'],
-            sast=scan['sast_result'],
-            ai_analysis=scan['ai_analysis']
-        ) if scan['status'] == 'completed' else None
-    )
-
-@app.get("/scans")
-def list_scans(limit: int = 50):
-    """Fetch the history of scans for the dashboard list."""
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT id, uuid, repo_url, status, submit_time, finished_at
-            FROM scans
-            ORDER BY id DESC
-            LIMIT %s
-        """, (limit,))
-        scans = cur.fetchall()
-        cur.close()
-        conn.close()
-        for scan in scans:
-            # Convert UUID and datetime objects to strings for JSON compatibility
-            if scan.get('uuid'):
-                scan['uuid'] = str(scan['uuid'])
-            if scan.get('submit_time'):
-                scan['submit_time'] = scan['submit_time'].isoformat()
-            if scan.get('finished_at'):
-                scan['finished_at'] = scan['finished_at'].isoformat()
-        return scans
-    except Exception as e:
-        logging.error(f"Database error in /scans: {e}")
-        raise HTTPException(status_code=500, detail=f"Database error: {e}")
-
 @app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
 async def get_remediation_plan(scan_id: str):
     if not model:
@@ -492,6 +443,27 @@ async def get_remediation_plan(scan_id: str):
     if not remediation_plan:
         raise HTTPException(status_code=500, detail="Failed to generate remediation plan.")
     return remediation_plan
+
+@app.get("/scan/{scan_id}", response_model=ScanStatus)
+async def get_scan_status(scan_id: uuid.UUID):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur.execute("SELECT status, sca_result, sast_result, ai_analysis FROM scans WHERE uuid = %s", (str(scan_id),))
+    scan = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan ID not found.")
+
+    return ScanStatus(
+        status=scan['status'],
+        result=ScanResultData(
+            sca=scan['sca_result'],
+            sast=scan['sast_result'],
+            ai_analysis=scan['ai_analysis']
+        ) if scan['status'] == 'completed' else None
+    )
 
 @app.post("/policies")
 async def upload_policy_document(file: UploadFile = File(...)):

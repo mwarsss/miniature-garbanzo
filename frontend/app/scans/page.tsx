@@ -25,6 +25,7 @@ import {
 // --- Types ---
 interface Scan {
   id: number;
+  uuid?: string;
   repo_url: string;
   status: 'queued' | 'processing' | 'completed' | 'failed';
   submit_time: string;
@@ -82,6 +83,7 @@ export default function ScansPage() {
           const res = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/scans?limit=50');
           if (res.ok) {
             const data = await res.json();
+            console.log("Scans data from backend:", data);
             setScans(data);
           } else {
             console.error("Failed to fetch scans:", res.status, await res.text());
@@ -98,13 +100,18 @@ export default function ScansPage() {
       fetchScans();
     }, []);
 
-  const fetchScanDetails = async (id: string) => {
+  const fetchScanDetails = async (uuid: string) => {
+    if (!uuid) {
+        console.error("fetchScanDetails called with undefined uuid");
+        return;
+    }
     setLoadingDetail(true);
     setShowDetailModal(true);
     setDetailedScanData(null);
     setDetailError(null);
+    setSelectedScanUuid(uuid);
     try {
-      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${id}`);
+      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${uuid}`);
       if (res.ok) {
         const data = await res.json();
         setDetailedScanData(data);
@@ -245,7 +252,13 @@ export default function ScansPage() {
                   <tr 
                     key={scan.id} 
                     className="hover:bg-slate-800/50 transition-colors group cursor-pointer"
-                    onClick={() => fetchScanDetails(scan.id.toString())} // Make row clickable
+                    onClick={() => {
+                        if (scan.uuid) {
+                            fetchScanDetails(scan.uuid);
+                        } else {
+                            console.error("Clicked scan with undefined UUID:", scan);
+                        }
+                    }} // Make row clickable
                   >
                     <td className="p-4 text-slate-500 font-mono text-sm">#{scan.id}</td>
                     <td className="p-4">
