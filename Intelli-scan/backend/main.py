@@ -5,6 +5,7 @@ import logging
 import os
 import shutil
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, Field
 from git import Repo, GitCommandError
 from typing import Dict, List, Optional
@@ -16,6 +17,12 @@ from psycopg2.extras import RealDictCursor
 import datetime
 from pypdf import PdfReader
 import io
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+
 
 # --- Basic Configuration ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -40,6 +47,11 @@ def get_db_connection():
 
 # --- FastAPI App Initialization ---
 app = FastAPI()
+
+@app.get("/health")
+def health_check():
+    return {"status": "ok"}
+
 
 # --- CORS Middleware ---
 app.add_middleware(
@@ -104,6 +116,23 @@ class ReportInfo(BaseModel):
     filename: str
     format: str
     generated_at: datetime.datetime
+
+class ScanSummary(BaseModel):
+    id: int
+    uuid: uuid.UUID
+    repo_url: str
+    status: str
+    submit_time: datetime.datetime
+    finished_at: Optional[datetime.datetime] = None
+
+
+class Scan(BaseModel):
+    id: int
+    uuid: uuid.UUID
+    repo_url: str
+    status: str
+    submit_time: datetime.datetime
+    finished_at: Optional[datetime.datetime] = None
 
 # --- Database Table Creation (on startup) ---
 @app.on_event("startup")
@@ -422,6 +451,29 @@ async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     background_tasks.add_task(_perform_scan, str(scan_uuid), request.repo_url)
     return {"scan_id": str(scan_uuid), "status": "queued"}
 
+@app.get("/scans", response_model=List[ScanSummary])
+def list_scans(limit: int = 50):
+    """Fetch the history of scans for the dashboard list."""
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor) 
+    try:
+        cur.execute("""
+            SELECT id, uuid, repo_url, status, submit_time, finished_at
+            FROM scans
+            ORDER BY submit_time DESC
+            LIMIT %s
+        """, (limit,))
+        
+        scans = cur.fetchall()
+        return scans
+        
+    except Exception as e:
+        logging.error(f"Error listing scans: {e}")
+        raise HTTPException(status_code=500, detail="Database error while fetching scans.")
+    finally:
+        cur.close()
+        conn.close()
+
 @app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
 async def get_remediation_plan(scan_id: str):
     if not model:
@@ -429,7 +481,13 @@ async def get_remediation_plan(scan_id: str):
         
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE uuid = %s", (scan_id,))
+    
+    try:
+        scan_id_int = int(scan_id)
+        cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE id = %s", (scan_id_int,))
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid scan ID format. Must be an integer.")
+        
     scan = cur.fetchone()
     cur.close()
     conn.close()
@@ -573,6 +631,91 @@ def list_reports(limit: int = 50):
                 logging.error(f"Database error in /reports: {e}")
                 raise HTTPException(status_code=500, detail="Database error.")
         
+@app.get("/scan/{scan_uuid}/remediation-pdf")
+async def generate_remediation_pdf(scan_uuid: str):
+    # 1. Fetch Raw Data from DB (The "Neat" Source)
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    # Note: We check both UUID and ID to be safe, but sticking to UUID is cleaner
+    cur.execute("SELECT repo_url, sca_result, sast_result FROM scans WHERE uuid = %s", (scan_uuid,))
+    scan = cur.fetchone()
+    cur.close()
+    conn.close()
+
+    if not scan:
+        raise HTTPException(status_code=404, detail="Scan not found")
+
+    # 2. Ask Gemini for the Patching Plan
+    # (We are skipping the intermediate 'Markdown' step and going straight to the solution)
+    prompt = f"""
+    You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}
+    
+    DATA SOURCES:
+    - SCA (Dependencies): {json.dumps(scan['sca_result'])[:10000]} 
+    - SAST (Code): {json.dumps(scan['sast_result'])[:10000]}
+
+    OUTPUT FORMAT:
+    Provide a professional, step-by-step patching guide. 
+    Focus ONLY on High/Critical severities.
+    Do not use Markdown formatting (like **bold**), just plain text with clear headers.
+    """
+    
+    # Check if model is loaded (from your existing code)
+    if not model:
+        ai_text = "AI Module not configured. Showing raw data summary."
+    else:
+        try:
+            response = await model.generate_content_async(prompt)
+            ai_text = response.text
+        except Exception as e:
+            ai_text = f"AI Generation Failed: {str(e)}"
+
+    # 3. Generate PDF in Memory
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=letter)
+    styles = getSampleStyleSheet()
+    story = []
+
+    # Title
+    story.append(Paragraph(f"Remediation Plan: {scan['repo_url']}", styles['Title']))
+    story.append(Spacer(1, 12))
+
+    # AI Content (Split by newlines to keep it readable)
+    for line in ai_text.split('\n'):
+        if line.strip():
+            story.append(Paragraph(line, styles['BodyText']))
+            story.append(Spacer(1, 6))
+
+    doc.build(story)
+    buffer.seek(0)
+
+    # 4. Stream it back to the browser
+    return StreamingResponse(
+        buffer, 
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=remediation_{scan_uuid}.pdf"}
+    )
+
+@app.get("/download/{report_id}")
+def download_report(report_id: int):
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    
+    # ✅ CORRECT: Fetch the content string from the DB
+    cur.execute("SELECT content, filename FROM reports WHERE id = %s", (report_id,))
+    report = cur.fetchone()
+    cur.close()
+    conn.close()
+    
+    if not report:
+        raise HTTPException(status_code=404, detail="Report not found")
+        
+    # Force the browser to download it as a file
+    return Response(
+        content=report['content'],
+        media_type="text/markdown",
+        headers={"Content-Disposition": f"attachment; filename={report['filename']}"}
+    )
         async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
             """
             Performs AI-powered remediation analysis on a Trivy JSON report.
