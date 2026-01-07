@@ -716,7 +716,7 @@ def download_report(report_id: int):
         media_type="text/markdown",
         headers={"Content-Disposition": f"attachment; filename={report['filename']}"}
     )
-        async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
+async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
             """
             Performs AI-powered remediation analysis on a Trivy JSON report.
             """
