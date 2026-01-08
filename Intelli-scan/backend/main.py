@@ -758,7 +758,8 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
         logging.error(f"Raw AI response that caused error: {response.text if 'response' in locals() else 'N/A'}")
         return None
 
-@app.get("/trivy_remediation", response_model=Optional[RemediationResult])async def get_trivy_remediation_plan():
+@app.get("/trivy_remediation", response_model=Optional[RemediationResult])
+async def get_trivy_remediation_plan():
     """
     Reads the Trivy report, generates a remediation plan via AI, and returns it.
     """
