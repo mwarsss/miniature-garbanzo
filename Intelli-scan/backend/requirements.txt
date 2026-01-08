@@ -8,3 +8,4 @@ google-generativeai
 google-api-python-client
 psycopg2-binary
 semgrep
+reportlab
