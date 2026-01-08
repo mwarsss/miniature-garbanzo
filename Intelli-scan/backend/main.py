@@ -716,65 +716,64 @@ def download_report(report_id: int):
         media_type="text/markdown",
         headers={"Content-Disposition": f"attachment; filename={report['filename']}"}
     )
+
 async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
-            """
-            Performs AI-powered remediation analysis on a Trivy JSON report.
-            """
-            if not model:
-                logging.warning("AI model not configured. Skipping Trivy remediation.")
-                return None
+    """
+    Performs AI-powered remediation analysis on a Trivy JSON report.
+    """
+    if not model:
+        logging.warning("AI model not configured. Skipping Trivy remediation.")
+        return None
+
+    policy_context = get_policy_context()
+    prompt = f"""
+    As a senior software security engineer, create a prioritized, actionable remediation plan 
+    based on the provided Trivy vulnerability scan report. Your response MUST be tailored for 
+    an analyst who needs to quickly address the most critical issues.
+
+    Your task is to:
+    1.  Identify the top 3 most critical vulnerabilities from the report based on severity.
+    2.  For each of these top vulnerabilities, provide a clear, step-by-step remediation guide.
+    3.  The remediation advice should be practical and easy to follow.
+    4.  Align your recommendations with the internal security policies provided below.
+
+    {policy_context}
+
+    ### Trivy SCA Scan Report ###
+    {json.dumps(trivy_json, indent=2)}
+
+    Generate a JSON object containing a list of the top 3 remediation steps. Each step must include
+    the issue, the exact code fix or command to run, and a clear explanation.
+
+    Format your response as a single JSON object under a 'remediations' key.
+    """
+    try:
+        response = await model.generate_content_async(prompt)
+        # It's common for the model to wrap its JSON in markdown, so we strip it.
+        cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
+        parsed_output = json.loads(cleaned_response)
+        return RemediationResult(**parsed_output)
+    except Exception as e:
+        logging.error(f"AI Trivy remediation failed: {e}")
+        logging.error(f"Raw AI response that caused error: {response.text if 'response' in locals() else 'N/A'}")
+        return None
+
+@app.get("/trivy_remediation", response_model=Optional[RemediationResult])async def get_trivy_remediation_plan():
+    """
+    Reads the Trivy report, generates a remediation plan via AI, and returns it.
+    """
+    try:
+        # Assuming report_trivy.json is in the same directory as main.py
+        with open("report_trivy.json", "r") as f:
+            trivy_data = json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(status_code=404, detail="report_trivy.json not found in the backend directory.")
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=500, detail="Failed to parse report_trivy.json.")
+
+    remediation_plan = await _perform_trivy_remediation(trivy_data)
+    
+    if not remediation_plan:
+        raise HTTPException(status_code=500, detail="Failed to generate AI remediation plan for Trivy report.")
         
-            policy_context = get_policy_context()
-            prompt = f"""
-            As a senior software security engineer, create a prioritized, actionable remediation plan 
-            based on the provided Trivy vulnerability scan report. Your response MUST be tailored for 
-            an analyst who needs to quickly address the most critical issues.
-        
-            Your task is to:
-            1.  Identify the top 3 most critical vulnerabilities from the report based on severity.
-            2.  For each of these top vulnerabilities, provide a clear, step-by-step remediation guide.
-            3.  The remediation advice should be practical and easy to follow.
-            4.  Align your recommendations with the internal security policies provided below.
-        
-            {policy_context}
-        
-            ### Trivy SCA Scan Report ###
-            {json.dumps(trivy_json, indent=2)}
-        
-            Generate a JSON object containing a list of the top 3 remediation steps. Each step must include
-            the issue, the exact code fix or command to run, and a clear explanation.
-        
-            Format your response as a single JSON object under a 'remediations' key.
-            """
-            try:
-                response = await model.generate_content_async(prompt)
-                # It's common for the model to wrap its JSON in markdown, so we strip it.
-                cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
-                parsed_output = json.loads(cleaned_response)
-                return RemediationResult(**parsed_output)
-            except Exception as e:
-                logging.error(f"AI Trivy remediation failed: {e}")
-                logging.error(f"Raw AI response that caused error: {response.text if 'response' in locals() else 'N/A'}")
-                return None
-        
-        @app.get("/trivy_remediation", response_model=Optional[RemediationResult])
-        async def get_trivy_remediation_plan():
-            """
-            Reads the Trivy report, generates a remediation plan via AI, and returns it.
-            """
-            try:
-                # Assuming report_trivy.json is in the same directory as main.py
-                with open("report_trivy.json", "r") as f:
-                    trivy_data = json.load(f)
-            except FileNotFoundError:
-                raise HTTPException(status_code=404, detail="report_trivy.json not found in the backend directory.")
-            except json.JSONDecodeError:
-                raise HTTPException(status_code=500, detail="Failed to parse report_trivy.json.")
-        
-            remediation_plan = await _perform_trivy_remediation(trivy_data)
-            
-            if not remediation_plan:
-                raise HTTPException(status_code=500, detail="Failed to generate AI remediation plan for Trivy report.")
-                
-            return remediation_plan
-        
+    return remediation_plan
