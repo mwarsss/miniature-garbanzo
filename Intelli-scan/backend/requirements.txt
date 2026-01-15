@@ -9,3 +9,10 @@ google-api-python-client
 psycopg2-binary
 semgrep
 reportlab
+pydantic-settings
+tenacity
+redis
+pytest
+pytest-asyncio
+pytest-cov
+httpx

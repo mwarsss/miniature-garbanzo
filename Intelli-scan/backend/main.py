@@ -1,73 +1,97 @@
 import subprocess
 import tempfile
 import json
-import logging
 import os
 import shutil
+import time
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
-from fastapi.responses import Response, StreamingResponse
+from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from git import Repo, GitCommandError
 from typing import Dict, List, Optional
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
 import google.generativeai as genai
-import psycopg2
-from psycopg2.extras import RealDictCursor
 import datetime
 from pypdf import PdfReader
 import io
 from reportlab.lib.pagesizes import letter
-from reportlab.pdfgen import canvas
-from reportlab.lib import colors
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from reportlab.lib.styles import getSampleStyleSheet
+from psycopg2.extras import RealDictCursor
 
+# Import new modules
+from config import settings
+from logger import setup_logging, get_logger
+from database import DatabasePool, create_tables
+from error_handlers import (
+    retry_on_failure,
+    handle_errors,
+    ScanError,
+    ScannerError,
+    AIAnalysisError,
+    gemini_circuit_breaker
+)
+from cache import get_cache, generate_cache_key
+from metrics import metrics, track_scan_metrics, track_ai_metrics
 
-# --- Basic Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# --- Setup Logging ---
+setup_logging(settings.log_level, settings.enable_structured_logging)
+logger = get_logger(__name__)
 
-# --- Environment Variables ---
-DATABASE_URL = os.getenv("DATABASE_URL")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-TRIVY_PATH = shutil.which("trivy") or "trivy"
-SEMGREP_PATH = shutil.which("semgrep") or "semgrep"
+# --- Initialize Database Pool ---
+db_pool = DatabasePool(settings.database_url, min_conn=2, max_conn=10)
 
-# --- Database Connection ---
-def get_db_connection():
-    if not DATABASE_URL:
-        logging.error("DATABASE_URL environment variable not set.")
-        raise HTTPException(status_code=500, detail="Database is not configured.")
-    try:
-        conn = psycopg2.connect(DATABASE_URL)
-        return conn
-    except psycopg2.OperationalError as e:
-        logging.error(f"Database connection failed: {e}")
-        raise HTTPException(status_code=500, detail=f"Database connection error: {e}")
+# --- Initialize Cache ---
+cache = get_cache(settings.cache_ttl_seconds)
 
 # --- FastAPI App Initialization ---
-app = FastAPI()
+app = FastAPI(
+    title="Intelli-Scan API",
+    description="AI-Augmented SAST Agent for intelligent vulnerability analysis",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
 
 @app.get("/health")
 def health_check():
-    return {"status": "ok"}
+    """Health check endpoint."""
+    try:
+        # Check database connectivity
+        with db_pool.get_cursor() as cur:
+            cur.execute("SELECT 1")
+        
+        return {
+            "status": "healthy",
+            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            "database": "connected",
+            "cache": "redis" if cache.redis_client else "memory"
+        }
+    except Exception as e:
+        logger.error(f"Health check failed: {e}")
+        return JSONResponse(
+            status_code=503,
+            content={"status": "unhealthy", "error": str(e)}
+        )
 
 
 # --- CORS Middleware ---
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # --- Google Generative AI Configuration ---
-if GOOGLE_API_KEY:
-    genai.configure(api_key=GOOGLE_API_KEY)
-    model = genai.GenerativeModel('gemini-1.0-pro')
+if settings.google_api_key:
+    genai.configure(api_key=settings.google_api_key)
+    model = genai.GenerativeModel(settings.ai_model_name)
+    logger.info(f"✅ Gemini AI configured with model: {settings.ai_model_name}")
 else:
-    logging.warning("GOOGLE_API_KEY not set. AI features will be disabled.")
+    logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")
     model = None
 
 # --- Pydantic Models ---
@@ -93,9 +117,9 @@ class ScanRequest(BaseModel):
     repo_url: str
 
 class ScanResultData(BaseModel):
-    sca: Optional[Dict]
-    sast: Optional[Dict]
-    ai_analysis: Optional[AIAnalysisResult]
+    sca: Optional[Dict] = None
+    sast: Optional[Dict] = None
+    ai_analysis: Optional[AIAnalysisResult] = None
 
 class ScanStatus(BaseModel):
     status: str
@@ -117,6 +141,7 @@ class ReportInfo(BaseModel):
     format: str
     generated_at: datetime.datetime
 
+
 class ScanSummary(BaseModel):
     id: int
     uuid: uuid.UUID
@@ -137,63 +162,37 @@ class Scan(BaseModel):
 # --- Database Table Creation (on startup) ---
 @app.on_event("startup")
 def startup_event():
-    conn = get_db_connection()
-    cur = conn.cursor()
+    """Initialize database tables and log startup info."""
+    logger.info("🚀 Starting Intelli-Scan API...")
+    logger.info(f"📊 Configuration: cache={settings.enable_caching}, log_level={settings.log_level}")
     
-    # Scans table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS scans (
-            id SERIAL PRIMARY KEY,
-            uuid UUID UNIQUE NOT NULL,
-            repo_url VARCHAR(255) NOT NULL,
-            status VARCHAR(50) NOT NULL,
-            submit_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-            finished_at TIMESTAMPTZ,
-            sca_result JSONB,
-            sast_result JSONB,
-            ai_analysis JSONB
-        );
-    """)
-    logging.info("Database table 'scans' is ready.")
+    try:
+        create_tables(settings.database_url)
+        logger.info("✅ Database tables initialized successfully")
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize database: {e}")
+        raise
 
-    # Policy documents table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS policy_documents (
-            id SERIAL PRIMARY KEY,
-            filename VARCHAR(255) NOT NULL,
-            content TEXT NOT NULL,
-            uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-    """)
-    logging.info("Database table 'policy_documents' is ready.")
+@app.on_event("shutdown")
+def shutdown_event():
+    """Cleanup on shutdown."""
+    logger.info("🛑 Shutting down Intelli-Scan API...")
+    db_pool.close_all()
+    logger.info("✅ Cleanup complete")
 
-    # Reports table
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS reports (
-            id SERIAL PRIMARY KEY,
-            scan_id INTEGER REFERENCES scans(id) ON DELETE CASCADE,
-            format VARCHAR(50) NOT NULL,
-            filename VARCHAR(255) NOT NULL,
-            content TEXT NOT NULL,
-            generated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-        );
-    """)
-    logging.info("Database table 'reports' is ready.")
-
-    conn.commit()
-    cur.close()
-    conn.close()
+# --- Metrics Endpoint ---
+@app.get("/metrics")
+def get_metrics():
+    """Get application metrics."""
+    return metrics.get_stats()
 
 # --- AI Helper Functions ---
 def get_policy_context() -> str:
     """Retrieves all policy documents from the database to form a context string."""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT filename, content FROM policy_documents ORDER BY uploaded_at DESC")
-        policies = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db_pool.get_cursor() as cur:
+            cur.execute("SELECT filename, content FROM policy_documents ORDER BY uploaded_at DESC")
+            policies = cur.fetchall()
         
         if not policies:
             return "No security policies provided."
@@ -204,14 +203,22 @@ def get_policy_context() -> str:
             context += f"{policy['content']}\n\n"
         return context
     except Exception as e:
-        logging.error(f"Could not retrieve policy context: {e}")
+        logger.error(f"Could not retrieve policy context: {e}")
         return "Error retrieving security policies."
 
+@retry_on_failure(max_attempts=settings.ai_max_retries)
+@handle_errors
 async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[AIAnalysisResult]:
-    if not model: return None
+    """Perform AI analysis with retry logic and circuit breaker."""
+    if not model:
+        logger.warning("AI model not configured, skipping analysis")
+        return None
     
-    policy_context = get_policy_context()
-    prompt = f"""
+    start_time = time.time()
+    
+    try:
+        policy_context = get_policy_context()
+        prompt = f"""
     As an expert security analyst, analyze the following scan results.
     Your response MUST be contextualized by the internal security policies provided.
     Instead of generic advice, reference specific policy documents or sections where applicable.
@@ -219,29 +226,71 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[
     {policy_context}
 
     ### Security Scan Results ###
-    SCA Results: {json.dumps(sca_result, indent=2)}
-    SAST Results: {json.dumps(sast_result, indent=2)}
+    SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
+    SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
 
     Generate a JSON response with an executive summary and the top 3 vulnerabilities,
     linking them to the policies. For example, if a policy requires MFA, and a finding
     relates to weak authentication, your POC should mention the specific policy.
     
-    Format your response as a single JSON object.
+    Format your response as a single JSON object with this exact structure:
+    {{
+        "summary": "Executive summary here",
+        "top_vulnerabilities": [
+            {{
+                "name": "Vulnerability name",
+                "severity": "HIGH",
+                "file": "filename.js",
+                "poc": "Proof of concept"
+            }}
+        ]
+    }}
     """
-    try:
-        response = await model.generate_content_async(prompt)
-        parsed_output = json.loads(response.text.strip())
-        return AIAnalysisResult(**parsed_output)
+        
+        # Use circuit breaker for AI calls
+        def call_ai():
+            return model.generate_content(prompt)
+        
+        response = gemini_circuit_breaker.call(call_ai)
+        
+        # Clean and parse response
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        parsed_output = json.loads(response_text)
+        result = AIAnalysisResult(**parsed_output)
+        
+        # Track metrics
+        duration_ms = (time.time() - start_time) * 1000
+        track_ai_metrics("analysis", True, duration_ms)
+        
+        logger.info(f"AI analysis completed in {duration_ms:.2f}ms")
+        return result
+        
     except Exception as e:
-        logging.error(f"AI analysis failed: {e}")
-        return None
+        duration_ms = (time.time() - start_time) * 1000
+        track_ai_metrics("analysis", False, duration_ms)
+        logger.error(f"AI analysis failed after {duration_ms:.2f}ms: {e}")
+        raise AIAnalysisError(f"AI analysis failed: {str(e)}")
 
 
+@retry_on_failure(max_attempts=settings.ai_max_retries)
+@handle_errors
 async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[RemediationResult]:
-    if not model: return None
+    """Generate remediation plan with retry logic and circuit breaker."""
+    if not model:
+        logger.warning("AI model not configured, skipping remediation")
+        return None
     
-    policy_context = get_policy_context()
-    prompt = f"""
+    start_time = time.time()
+    
+    try:
+        policy_context = get_policy_context()
+        prompt = f"""
     As a senior software security engineer, create a remediation plan based on the scan results.
     Your fixes and explanations MUST align with the provided internal security policies.
     Reference the policies to justify your proposed code changes.
@@ -249,58 +298,125 @@ async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Option
     {policy_context}
 
     ### Security Scan Results ###
-    SCA Results: {json.dumps(sca_result, indent=2)}
-    SAST Results: {json.dumps(sast_result, indent=2)}
+    SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
+    SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
 
     Generate a JSON object containing a list of remediation steps. Each step must include
     the issue, the exact code fix, and an explanation that references the relevant internal policy.
 
-    Format your response as a single JSON object.
+    Format your response as a single JSON object with this exact structure:
+    {{
+        "remediations": [
+            {{
+                "issue": "Issue name",
+                "fix_code": "Code fix here",
+                "explanation": "Why this fixes it"
+            }}
+        ]
+    }}
     """
-    try:
-        logging.info(f"AI remediation prompt: {prompt}")
-        response = await model.generate_content_async(prompt)
-        logging.info(f"AI remediation response: {response.text}")
-        parsed_output = json.loads(response.text.strip())
-        return RemediationResult(**parsed_output)
+        
+        def call_ai():
+            return model.generate_content(prompt)
+        
+        response = gemini_circuit_breaker.call(call_ai)
+        
+        # Clean and parse response
+        response_text = response.text.strip()
+        if response_text.startswith("```json"):
+            response_text = response_text[7:]
+        if response_text.endswith("```"):
+            response_text = response_text[:-3]
+        response_text = response_text.strip()
+        
+        parsed_output = json.loads(response_text)
+        result = RemediationResult(**parsed_output)
+        
+        # Track metrics
+        duration_ms = (time.time() - start_time) * 1000
+        track_ai_metrics("remediation", True, duration_ms)
+        
+        logger.info(f"AI remediation completed in {duration_ms:.2f}ms")
+        return result
+        
     except Exception as e:
-        logging.error(f"AI remediation failed: {e}")
-        return None
+        duration_ms = (time.time() - start_time) * 1000
+        track_ai_metrics("remediation", False, duration_ms)
+        logger.error(f"AI remediation failed after {duration_ms:.2f}ms: {e}")
+        raise AIAnalysisError(f"AI remediation failed: {str(e)}")
+
 
 # --- Scanner Helper Functions ---
+@handle_errors
 def _run_trivy_scan(directory: str) -> dict:
-    """Runs Trivy filesystem scan with optimizations."""
+    """Runs Trivy filesystem scan with optimizations and error handling."""
+    start_time = time.time()
+    
     try:
-        logging.info(f"[{datetime.datetime.now()}] Running Trivy scan in {directory}...")
+        logger.info(f"Starting Trivy scan in {directory}")
         trivy_cmd = [
-            TRIVY_PATH, "fs", directory,
+            settings.trivy_path, "fs", directory,
             "--format", "json",
             "--quiet",
-            "--timeout", "15m",
+            "--timeout", f"{settings.scan_timeout_minutes}m",
             "--skip-dirs", os.path.join(directory, "node_modules"),
             "--skip-dirs", os.path.join(directory, ".git"),
         ]
-        process = subprocess.run(trivy_cmd, capture_output=True, text=True, check=False)
+        
+        process = subprocess.run(
+            trivy_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=settings.scan_timeout_minutes * 60
+        )
 
+        duration_ms = (time.time() - start_time) * 1000
+        
         if process.returncode != 0:
-            logging.error(f"Trivy scan failed. Stderr: {process.stderr}")
+            logger.error(f"Trivy scan failed. Stderr: {process.stderr}")
+            metrics.increment("scans.trivy.failures")
+            
             # Try to parse stdout anyway, it might contain partial results
             try:
-                return json.loads(process.stdout) if process.stdout else {"error": f"Trivy scan failed. Stderr: {process.stderr}"}
+                result = json.loads(process.stdout) if process.stdout else {
+                    "error": f"Trivy scan failed. Stderr: {process.stderr}"
+                }
+                metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "partial"})
+                return result
             except json.JSONDecodeError:
-                return {"error": f"Trivy scan failed and output was not valid JSON. Stderr: {process.stderr}"}
+                metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "failed"})
+                raise ScannerError(f"Trivy scan failed and output was not valid JSON. Stderr: {process.stderr}")
         
-        return json.loads(process.stdout) if process.stdout else {}
+        result = json.loads(process.stdout) if process.stdout else {}
+        metrics.increment("scans.trivy.success")
+        metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "success"})
+        logger.info(f"Trivy scan completed in {duration_ms:.2f}ms")
+        
+        return result
+        
+    except subprocess.TimeoutExpired:
+        duration_ms = (time.time() - start_time) * 1000
+        metrics.increment("scans.trivy.timeouts")
+        metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "timeout"})
+        logger.error(f"Trivy scan timed out after {duration_ms:.2f}ms")
+        raise ScannerError(f"Trivy scan timed out after {settings.scan_timeout_minutes} minutes")
     except Exception as e:
-        logging.error(f"Exception during Trivy scan: {e}")
-        return {"error": str(e)}
+        duration_ms = (time.time() - start_time) * 1000
+        metrics.increment("scans.trivy.errors")
+        metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "error"})
+        logger.error(f"Exception during Trivy scan: {e}")
+        raise ScannerError(f"Trivy scan error: {str(e)}")
 
+@handle_errors
 def _run_semgrep_scan(directory: str) -> dict:
-    """Runs Semgrep scan with optimizations."""
+    """Runs Semgrep scan with optimizations and error handling."""
+    start_time = time.time()
+    
     try:
-        logging.info(f"[{datetime.datetime.now()}] Running Semgrep scan in {directory}...")
+        logger.info(f"Starting Semgrep scan in {directory}")
         semgrep_cmd = [
-            SEMGREP_PATH, "scan",
+            settings.semgrep_path, "scan",
             "--config=p/security-audit",
             "--json",
             "--timeout", "5",
@@ -309,15 +425,44 @@ def _run_semgrep_scan(directory: str) -> dict:
             "--exclude", "package-lock.json",
             directory
         ]
-        process = subprocess.run(semgrep_cmd, capture_output=True, text=True, check=False)
+        
+        process = subprocess.run(
+            semgrep_cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=settings.scan_timeout_minutes * 60
+        )
+
+        duration_ms = (time.time() - start_time) * 1000
 
         if process.returncode != 0:
-            logging.error(f"Semgrep scan failed. Stderr: {process.stderr}")
+            logger.warning(f"Semgrep scan returned non-zero exit code. Stderr: {process.stderr}")
+            metrics.increment("scans.semgrep.warnings")
 
-        return json.loads(process.stdout) if process.stdout else {"error": process.stderr or "Semgrep returned no output."}
+        result = json.loads(process.stdout) if process.stdout else {
+            "error": process.stderr or "Semgrep returned no output."
+        }
+        
+        metrics.increment("scans.semgrep.success")
+        metrics.histogram("scans.semgrep.duration_ms", duration_ms, {"status": "success"})
+        logger.info(f"Semgrep scan completed in {duration_ms:.2f}ms")
+        
+        return result
+        
+    except subprocess.TimeoutExpired:
+        duration_ms = (time.time() - start_time) * 1000
+        metrics.increment("scans.semgrep.timeouts")
+        metrics.histogram("scans.semgrep.duration_ms", duration_ms, {"status": "timeout"})
+        logger.error(f"Semgrep scan timed out after {duration_ms:.2f}ms")
+        raise ScannerError(f"Semgrep scan timed out after {settings.scan_timeout_minutes} minutes")
     except Exception as e:
-        logging.error(f"Exception during Semgrep scan: {e}")
-        return {"error": str(e)}
+        duration_ms = (time.time() - start_time) * 1000
+        metrics.increment("scans.semgrep.errors")
+        metrics.histogram("scans.semgrep.duration_ms", duration_ms, {"status": "error"})
+        logger.error(f"Exception during Semgrep scan: {e}")
+        raise ScannerError(f"Semgrep scan error: {str(e)}")
+
 
 # --- Report Generation Helper ---
 def generate_markdown_report(scan: dict) -> str:
@@ -392,12 +537,9 @@ def generate_markdown_report(scan: dict) -> str:
 
 # --- Background Scan Task ---
 async def _perform_scan(scan_uuid: str, repo_url: str):
-    conn = get_db_connection()
-    cur = conn.cursor()
-
     def update_status(status: str, message: Optional[str] = None):
-        cur.execute("UPDATE scans SET status = %s WHERE uuid = %s", (status, scan_uuid))
-        conn.commit()
+        with db_pool.get_cursor() as cur:
+            cur.execute("UPDATE scans SET status = %s WHERE uuid = %s", (status, scan_uuid))
 
     update_status("processing")
 
@@ -405,7 +547,7 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
         try:
             Repo.clone_from(repo_url, temp_dir, depth=1)
         except GitCommandError as e:
-            logging.error(f"[{scan_uuid}] Git clone error: {e}")
+            logger.error(f"[{scan_uuid}] Git clone error: {e}")
             update_status("failed")
             return
 
@@ -413,40 +555,34 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
         sast_result = _run_semgrep_scan(temp_dir)
         ai_analysis_result = await _perform_ai_analysis(sca_result, sast_result)
 
-        cur.execute(
-            """
-            UPDATE scans
-            SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s, finished_at = %s
-            WHERE uuid = %s
-            """,
-            (
-                "completed",
-                json.dumps(sca_result),
-                json.dumps(sast_result),
-                ai_analysis_result.model_dump_json() if ai_analysis_result else None,
-                datetime.datetime.now(datetime.timezone.utc),
-                scan_uuid
+        with db_pool.get_cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scans
+                SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s, finished_at = %s
+                WHERE uuid = %s
+                """,
+                (
+                    "completed",
+                    json.dumps(sca_result),
+                    json.dumps(sast_result),
+                    ai_analysis_result.model_dump_json() if ai_analysis_result else None,
+                    datetime.datetime.now(datetime.timezone.utc),
+                    scan_uuid
+                )
             )
-        )
-        conn.commit()
 
-    cur.close()
-    conn.close()
-    logging.info(f"[{scan_uuid}] Scan completed and saved to database.")
+    logger.info(f"[{scan_uuid}] Scan completed and saved to database.")
 
 # --- API Endpoints ---
 @app.post("/scan", status_code=202)
 async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     scan_uuid = uuid.uuid4()
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO scans (uuid, repo_url, status) VALUES (%s, %s, %s)",
-        (str(scan_uuid), request.repo_url, "queued")
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
+    with db_pool.get_cursor() as cur:
+        cur.execute(
+            "INSERT INTO scans (uuid, repo_url, status) VALUES (%s, %s, %s)",
+            (str(scan_uuid), request.repo_url, "queued")
+        )
 
     background_tasks.add_task(_perform_scan, str(scan_uuid), request.repo_url)
     return {"scan_id": str(scan_uuid), "status": "queued"}
@@ -454,43 +590,37 @@ async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
 @app.get("/scans", response_model=List[ScanSummary])
 def list_scans(limit: int = 50):
     """Fetch the history of scans for the dashboard list."""
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor) 
     try:
-        cur.execute("""
-            SELECT id, uuid, repo_url, status, submit_time, finished_at
-            FROM scans
-            ORDER BY submit_time DESC
-            LIMIT %s
-        """, (limit,))
-        
-        scans = cur.fetchall()
+        with db_pool.get_cursor() as cur:
+            cur.execute (
+                """
+                SELECT id, uuid, repo_url, status, submit_time, finished_at
+                FROM scans
+                ORDER BY submit_time DESC
+                LIMIT %s
+                """, (limit,))
+            scans = cur.fetchall()
         return scans
         
     except Exception as e:
-        logging.error(f"Error listing scans: {e}")
+        logger.error(f"Error listing scans: {e}")
         raise HTTPException(status_code=500, detail="Database error while fetching scans.")
-    finally:
-        cur.close()
-        conn.close()
 
 @app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
 async def get_remediation_plan(scan_id: str):
     if not model:
         raise HTTPException(status_code=500, detail="AI model is not configured. GOOGLE_API_KEY may be missing.")
         
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
     try:
         scan_id_int = int(scan_id)
-        cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE id = %s", (scan_id_int,))
+        with db_pool.get_cursor() as cur:
+            cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE id = %s", (scan_id_int,))
+            scan = cur.fetchone()
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid scan ID format. Must be an integer.")
-        
-    scan = cur.fetchone()
-    cur.close()
-    conn.close()
+    except Exception as e:
+        logger.error(f"Error fetching scan for remediation: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
 
     if not scan:
         raise HTTPException(status_code=404, detail="Scan ID not found.")
@@ -504,12 +634,13 @@ async def get_remediation_plan(scan_id: str):
 
 @app.get("/scan/{scan_id}", response_model=ScanStatus)
 async def get_scan_status(scan_id: uuid.UUID):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    cur.execute("SELECT status, sca_result, sast_result, ai_analysis FROM scans WHERE uuid = %s", (str(scan_id),))
-    scan = cur.fetchone()
-    cur.close()
-    conn.close()
+    try:
+        with db_pool.get_cursor() as cur:
+            cur.execute("SELECT status, sca_result, sast_result, ai_analysis FROM scans WHERE uuid = %s", (str(scan_id),))
+            scan = cur.fetchone()
+    except Exception as e:
+        logger.error(f"Error fetching scan status: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
 
     if not scan:
         raise HTTPException(status_code=404, detail="Scan ID not found.")
@@ -545,22 +676,18 @@ async def upload_policy_document(file: UploadFile = File(...)):
         if not content.strip():
             raise HTTPException(status_code=400, detail="The uploaded document is empty or could not be read.")
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-        # Simple approach: replace the document if it already exists to avoid duplicates
-        cur.execute("DELETE FROM policy_documents WHERE filename = %s", (filename,))
-        cur.execute(
-            "INSERT INTO policy_documents (filename, content) VALUES (%s, %s)",
-            (filename, content)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_pool.get_cursor() as cur:
+            # Simple approach: replace the document if it already exists to avoid duplicates
+            cur.execute("DELETE FROM policy_documents WHERE filename = %s", (filename,))
+            cur.execute(
+                "INSERT INTO policy_documents (filename, content) VALUES (%s, %s)",
+                (filename, content)
+            )
 
         return {"status": "success", "filename": filename, "chars_read": len(content)}
     
     except Exception as e:
-        logging.error(f"Failed to upload or process policy document '{filename}': {e}")
+        logger.error(f"Failed to upload or process policy document '{filename}': {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
 
 # --- Report Endpoints ---
@@ -571,19 +698,14 @@ def generate_report(request: ReportRequest):
         raise HTTPException(status_code=400, detail="Unsupported format. Only 'markdown' is available.")
 
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT * FROM scans WHERE id = %s", (request.scan_id,))
-        scan = cur.fetchone()
+        with db_pool.get_cursor() as cur:
+            cur.execute("SELECT * FROM scans WHERE id = %s", (request.scan_id,))
+            scan = cur.fetchone()
         
         if not scan:
-            cur.close()
-            conn.close()
             raise HTTPException(status_code=404, detail="Scan ID not found.")
         
         if scan['status'] != 'completed':
-            cur.close()
-            conn.close()
             raise HTTPException(status_code=400, detail="Cannot generate report for a scan that is not completed.")
 
         report_content = generate_markdown_report(scan)
@@ -592,55 +714,52 @@ def generate_report(request: ReportRequest):
         filename = f"report_scan_{request.scan_id}_{timestamp}.md"
 
         # Save report to the database
-        cur.execute(
-            """
-            INSERT INTO reports (scan_id, format, filename, content)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (request.scan_id, request.format, filename, report_content)
-        )
-        conn.commit()
-        cur.close()
-        conn.close()
+        with db_pool.get_cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO reports (scan_id, format, filename, content)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (request.scan_id, request.format, filename, report_content)
+            )
 
         return ReportResponse(report_content=report_content, filename=filename)
 
     except HTTPException as e:
         raise e  # Re-raise HTTPException to preserve status code and detail
     except Exception as e:
-        logging.error(f"Failed to generate report for scan_id {request.scan_id}: {e}")
+        logger.error(f"Failed to generate report for scan_id {request.scan_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to generate report.")
 
 @app.get("/reports", response_model=List[ReportInfo])
 def list_reports(limit: int = 50):
     """Lists previously generated reports."""
     try:
-        conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("""
-            SELECT id, scan_id, filename, format, generated_at
-            FROM reports
-            ORDER BY generated_at DESC
-            LIMIT %s
-        """, (limit,))
-        reports = cur.fetchall()
-        cur.close()
-        conn.close()
+        with db_pool.get_cursor() as cur:
+            cur.execute (
+                """
+                SELECT id, scan_id, filename, format, generated_at
+                FROM reports
+                ORDER BY generated_at DESC
+                LIMIT %s
+                """, (limit,))
+            reports = cur.fetchall()
         return reports
     except Exception as e:
-                logging.error(f"Database error in /reports: {e}")
+                logger.error(f"Database error in /reports: {e}")
                 raise HTTPException(status_code=500, detail="Database error.")
         
 @app.get("/scan/{scan_uuid}/remediation-pdf")
 async def generate_remediation_pdf(scan_uuid: str):
     # 1. Fetch Raw Data from DB (The "Neat" Source)
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    # Note: We check both UUID and ID to be safe, but sticking to UUID is cleaner
-    cur.execute("SELECT repo_url, sca_result, sast_result FROM scans WHERE uuid = %s", (scan_uuid,))
-    scan = cur.fetchone()
-    cur.close()
-    conn.close()
+    try:
+        with db_pool.get_cursor() as cur:
+            # Note: We check both UUID and ID to be safe, but sticking to UUID is cleaner
+            cur.execute("SELECT repo_url, sca_result, sast_result FROM scans WHERE uuid = %s", (scan_uuid,))
+            scan = cur.fetchone()
+    except Exception as e:
+        logger.error(f"Error fetching scan for PDF: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
 
     if not scan:
         raise HTTPException(status_code=404, detail="Scan not found")
@@ -648,8 +767,7 @@ async def generate_remediation_pdf(scan_uuid: str):
     # 2. Ask Gemini for the Patching Plan
     # (We are skipping the intermediate 'Markdown' step and going straight to the solution)
     prompt = f"""
-    You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}
-    
+    You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}    
     DATA SOURCES:
     - SCA (Dependencies): {json.dumps(scan['sca_result'])[:10000]} 
     - SAST (Code): {json.dumps(scan['sast_result'])[:10000]}
@@ -698,14 +816,14 @@ async def generate_remediation_pdf(scan_uuid: str):
 
 @app.get("/download/{report_id}")
 def download_report(report_id: int):
-    conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
-    # ✅ CORRECT: Fetch the content string from the DB
-    cur.execute("SELECT content, filename FROM reports WHERE id = %s", (report_id,))
-    report = cur.fetchone()
-    cur.close()
-    conn.close()
+    try:
+        with db_pool.get_cursor() as cur:
+            # ✅ CORRECT: Fetch the content string from the DB
+            cur.execute("SELECT content, filename FROM reports WHERE id = %s", (report_id,))
+            report = cur.fetchone()
+    except Exception as e:
+        logger.error(f"Error fetching report for download: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
     
     if not report:
         raise HTTPException(status_code=404, detail="Report not found")
@@ -722,7 +840,7 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
     Performs AI-powered remediation analysis on a Trivy JSON report.
     """
     if not model:
-        logging.warning("AI model not configured. Skipping Trivy remediation.")
+        logger.warning("AI model not configured. Skipping Trivy remediation.")
         return None
 
     policy_context = get_policy_context()
@@ -754,8 +872,8 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
         parsed_output = json.loads(cleaned_response)
         return RemediationResult(**parsed_output)
     except Exception as e:
-        logging.error(f"AI Trivy remediation failed: {e}")
-        logging.error(f"Raw AI response that caused error: {response.text if 'response' in locals() else 'N/A'}")
+        logger.error(f"AI Trivy remediation failed: {e}")
+        logger.error(f"Raw AI response that caused error: {response.text if 'response' in locals() else 'N/A'}")
         return None
 
 @app.get("/trivy_remediation", response_model=Optional[RemediationResult])
