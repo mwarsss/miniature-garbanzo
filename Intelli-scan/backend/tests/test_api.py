@@ -87,3 +87,68 @@ async def test_scan_status_not_found(client, mock_db_pool):
     fake_uuid = str(uuid.uuid4())
     response = client.get(f"/scan/{fake_uuid}")
     assert response.status_code == 404
+
+
+def test_remediation_scan_not_found(client, mock_db_pool):
+    """Test remediation endpoint with non-existent scan."""
+    mock_cursor = Mock()
+    mock_db_pool.get_cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = None
+    
+    response = client.get("/scan/999/remediation")
+    assert response.status_code == 404
+
+
+def test_remediation_scan_not_completed(client, mock_db_pool):
+    """Test remediation endpoint with incomplete scan."""
+    mock_cursor = Mock()
+    mock_db_pool.get_cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = {
+        'status': 'processing',
+        'sca_result': {},
+        'sast_result': {}
+    }
+    
+    response = client.get("/scan/1/remediation")
+    assert response.status_code == 400
+    assert "not completed" in response.json()["detail"].lower()
+
+
+@patch('main.model')
+@patch('main._perform_ai_remediation')
+def test_remediation_success(mock_remediation, mock_model, client, mock_db_pool):
+    """Test successful remediation generation."""
+    # Mock database
+    mock_cursor = Mock()
+    mock_db_pool.get_cursor.return_value.__enter__.return_value = mock_cursor
+    mock_cursor.fetchone.return_value = {
+        'status': 'completed',
+        'sca_result': {'Results': []},
+        'sast_result': {'results': []}
+    }
+    
+    # Mock AI remediation
+    from main import RemediationResult, RemediationDetail
+    mock_remediation.return_value = RemediationResult(
+        remediations=[
+            RemediationDetail(
+                issue="SQL Injection",
+                fix_code="Use parameterized queries",
+                explanation="Prevents SQL injection attacks"
+            )
+        ]
+    )
+    
+    response = client.get("/scan/1/remediation")
+    assert response.status_code == 200
+    data = response.json()
+    assert "remediations" in data
+    assert len(data["remediations"]) == 1
+    assert data["remediations"][0]["issue"] == "SQL Injection"
+
+
+def test_remediation_invalid_scan_id(client, mock_db_pool):
+    """Test remediation endpoint with invalid scan ID format."""
+    response = client.get("/scan/invalid/remediation")
+    assert response.status_code == 400
+    assert "invalid" in response.json()["detail"].lower()
