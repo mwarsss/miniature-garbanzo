@@ -49,7 +49,7 @@ export default function ReportsPage() {
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
   const [remediating, setRemediating] = useState(false);
-  const [report, setReport] = useState<{content: string, filename: string} | null>(null);
+  const [report, setReport] = useState<{ content: string, filename: string } | null>(null);
   const [remediationPlan, setRemediationPlan] = useState<RemediationResult | null>(null);
   const [error, setError] = useState<string | null>(null); // State for error messages
 
@@ -68,8 +68,8 @@ export default function ReportsPage() {
           const completed = scansData.filter((s: any) => s.status === 'completed');
           setScans(completed);
         } else {
-           console.error("Failed to fetch scans");
-           setScans([]);
+          console.error("Failed to fetch scans");
+          setScans([]);
         }
 
         if (reportsRes.ok) {
@@ -118,8 +118,8 @@ export default function ReportsPage() {
         setError(`Error generating report: ${errorMessage}`);
       }
     } catch (error) {
-        console.error(error);
-        setError("An unexpected error occurred while generating the report.");
+      console.error(error);
+      setError("An unexpected error occurred while generating the report.");
     } finally {
       setGenerating(false);
     }
@@ -155,13 +155,31 @@ export default function ReportsPage() {
   };
 
   const downloadReport = (content: string, filename: string) => {
-      const element = document.createElement("a");
-      const file = new Blob([content], {type: 'text/markdown'});
-      element.href = URL.createObjectURL(file);
-      element.download = filename;
-      document.body.appendChild(element); 
-      element.click();
-      document.body.removeChild(element);
+    const element = document.createElement("a");
+    const file = new Blob([content], { type: 'text/markdown' });
+    element.href = URL.createObjectURL(file);
+    element.download = filename;
+    document.body.appendChild(element);
+    element.click();
+    document.body.removeChild(element);
+  };
+
+  // Helper function to get custom display name for a report based on scan info
+  const getReportDisplayName = (scanId: number): string => {
+    const scan = scans.find(s => s.id === scanId);
+    if (!scan) {
+      return `Report for Scan #${scanId}`;
+    }
+
+    // Extract repo name from URL (e.g., "owner/repo" from "https://github.com/owner/repo")
+    const repoName = scan.repo_url.replace('https://github.com/', '').replace('.git', '');
+    const date = new Date(scan.finished_at).toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      year: 'numeric'
+    });
+
+    return `${repoName} - Security Report (${date})`;
   };
 
   return (
@@ -200,7 +218,7 @@ export default function ReportsPage() {
 
       {/* --- MAIN CONTENT --- */}
       <main className="ml-64 p-8">
-      
+
         <header className="mb-8">
           <div className="flex items-center gap-3 mb-2">
             <div className="p-2 bg-blue-500/10 rounded-lg border border-blue-500/20">
@@ -217,71 +235,69 @@ export default function ReportsPage() {
           <div className="lg:col-span-2 bg-slate-900 border border-slate-800 rounded-xl p-8 shadow-xl">
             <h2 className="text-xl font-bold text-white mb-6">Generate New Report</h2>
             <div className="mb-6">
-                <label className="block text-sm font-medium text-slate-300 mb-2">1. Select a Completed Scan</label>
-                <div className="relative">
-                    <select 
-                        value={selectedScan}
-                        onChange={(e) => setSelectedScan(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg py-3 pl-4 pr-10 text-slate-200 focus:outline-none focus:border-blue-500 appearance-none cursor-pointer disabled:opacity-50"
-                        disabled={loading}
-                    >
-                        <option value="" disabled>-- Choose a scan --</option>
-                        {scans.map(scan => (
-                            <option key={scan.id} value={scan.id}>
-                                #{scan.id} - {scan.repo_url.replace('https://github.com/', '')} ({new Date(scan.finished_at).toLocaleDateString()})
-                            </option>
-                        ))}
-                    </select>
-                    <div className="absolute right-4 top-3.5 pointer-events-none text-slate-500">▼</div>
-                </div>
+              <label className="block text-sm font-medium text-slate-300 mb-2">1. Select a Completed Scan</label>
+              <div className="relative">
+                <select
+                  value={selectedScan}
+                  onChange={(e) => setSelectedScan(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg py-3 pl-4 pr-10 text-slate-200 focus:outline-none focus:border-blue-500 appearance-none cursor-pointer disabled:opacity-50"
+                  disabled={loading}
+                >
+                  <option value="" disabled>-- Choose a scan --</option>
+                  {scans.map(scan => (
+                    <option key={scan.id} value={scan.id}>
+                      #{scan.id} - {scan.repo_url.replace('https://github.com/', '')} ({new Date(scan.finished_at).toLocaleDateString()})
+                    </option>
+                  ))}
+                </select>
+                <div className="absolute right-4 top-3.5 pointer-events-none text-slate-500">▼</div>
+              </div>
             </div>
-            
+
             <div className="flex gap-4">
-              <button 
-                  onClick={handleGenerate}
-                  disabled={!selectedScan || generating}
-                  className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${ 
-                      !selectedScan || generating
-                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                      : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+              <button
+                onClick={handleGenerate}
+                disabled={!selectedScan || generating}
+                className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${!selectedScan || generating
+                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
                   }`}
               >
-                  {generating ? <><Loader2 className="h-5 w-5 animate-spin" />Generating...</> : <><FileText className="h-5 w-5" />Generate Report</>}
+                {generating ? <><Loader2 className="h-5 w-5 animate-spin" />Generating...</> : <><FileText className="h-5 w-5" />Generate Report</>}
               </button>
-              <button 
-                  onClick={handleRemediation}
-                  disabled={remediating}
-                  className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${ 
-                      remediating
-                      ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
-                      : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20'
+              <button
+                onClick={handleRemediation}
+                disabled={remediating}
+                className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${remediating
+                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20'
                   }`}
               >
-                  {remediating ? <><Loader2 className="h-5 w-5 animate-spin" />Analyzing...</> : <><Shield className="h-5 w-5" />Get AI Remediation</>}
+                {remediating ? <><Loader2 className="h-5 w-5 animate-spin" />Analyzing...</> : <><Shield className="h-5 w-5" />Get AI Remediation</>}
               </button>
             </div>
-            
+
             {error && <ErrorDisplay message={error} onClose={() => setError(null)} />}
 
             {report && (
-                <div className="mt-8 p-4 bg-emerald-900/10 border border-emerald-900/30 rounded-lg animate-in fade-in slide-in-from-bottom-4">
-                    <div className="flex items-center gap-3 mb-4 text-emerald-400">
-                        <CheckCircle className="h-5 w-5" />
-                        <span className="font-semibold">Report Generated Successfully</span>
-                    </div>
-                    <div className="bg-slate-950 p-4 rounded border border-slate-800 text-xs font-mono text-slate-400 h-32 overflow-y-auto mb-4">
-                        {report.content}
-                    </div>
-                    <button 
-                        onClick={() => downloadReport(report.content, report.filename)}
-                        className="w-full py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-lg flex items-center justify-center gap-2 transition-colors"
-                    >
-                        <Download className="h-4 w-4" />
-                        Download {report.filename}
-                    </button>
+              <div className="mt-8 p-4 bg-emerald-900/10 border border-emerald-900/30 rounded-lg animate-in fade-in slide-in-from-bottom-4">
+                <div className="flex items-center gap-3 mb-4 text-emerald-400">
+                  <CheckCircle className="h-5 w-5" />
+                  <span className="font-semibold">Report Generated Successfully</span>
                 </div>
+                <div className="bg-slate-950 p-4 rounded border border-slate-800 text-xs font-mono text-slate-400 h-32 overflow-y-auto mb-4">
+                  {report.content}
+                </div>
+                <button
+                  onClick={() => downloadReport(report.content, report.filename)}
+                  className="w-full py-2 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-lg flex items-center justify-center gap-2 transition-colors"
+                >
+                  <Download className="h-4 w-4" />
+                  Download {report.filename}
+                </button>
+              </div>
             )}
-            
+
             {remediationPlan && (
               <div className="mt-8 animate-in fade-in slide-in-from-bottom-4">
                 <h3 className="text-xl font-bold text-white mb-4">Top 3 AI Remediation Steps</h3>
@@ -310,20 +326,23 @@ export default function ReportsPage() {
             </h3>
             <div className="space-y-3">
               {loading ? (
-                 <div className="text-center p-4 text-slate-500">Loading...</div>
+                <div className="text-center p-4 text-slate-500">Loading...</div>
               ) : pastReports.length > 0 ? (
                 pastReports.map(pr => (
                   <div key={pr.id} className="flex items-center justify-between p-3 bg-slate-950/50 rounded-lg border border-slate-800/50">
-                    <div>
-                      <p className="text-sm font-medium text-slate-200">{pr.filename}</p>
-                      <p className="text-xs text-slate-500">Scan #{pr.scan_id} &bull; {new Date(pr.generated_at).toLocaleDateString()}</p>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm font-medium text-slate-200 truncate">{getReportDisplayName(pr.scan_id)}</p>
+                      <p className="text-xs text-slate-500">
+                        {pr.filename} • {new Date(pr.generated_at).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}
+                      </p>
                     </div>
-                    <button 
+                    <button
                       onClick={async () => {
                         setSelectedScan(pr.scan_id.toString());
                         await handleGenerate();
                       }}
-                      className="p-2 text-slate-400 hover:text-blue-400 transition-colors"
+                      className="p-2 text-slate-400 hover:text-blue-400 transition-colors flex-shrink-0 ml-2"
+                      title="Re-generate this report"
                     >
                       <Download className="h-4 w-4" />
                     </button>
@@ -349,17 +368,16 @@ function NavItem({ icon, label, href }: { icon: React.ReactNode, label: string, 
   const active = pathname === href;
 
   const content = (
-    <div className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${
-      active
-        ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
-        : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
-    }`}>
+    <div className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-sm font-medium transition-all ${active
+      ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
+      : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
+      }`}>
       {React.cloneElement(icon as React.ReactElement, { size: 18 })}
       {label}
     </div>
   );
 
-  return ( <Link href={href}>{content}</Link> );
+  return (<Link href={href}>{content}</Link>);
 }
 
 // --- Subcomponent: Error Display ---
