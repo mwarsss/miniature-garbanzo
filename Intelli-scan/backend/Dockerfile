@@ -5,7 +5,7 @@ FROM python:3.11 AS builder
 RUN apt-get update && apt-get install -y curl python3-pip git
 
 # Install Trivy
-RUN curl -L "https://github.com/aquasecurity/trivy/releases/download/v0.67.2/trivy_0.67.2_Linux-64bit.tar.gz" -o trivy.tar.gz && \
+RUN curl -L "https://github.com/aquasecurity/trivy/releases/download/v0.69.3/trivy_0.69.3_Linux-64bit.tar.gz" -o trivy.tar.gz && \
     tar -zxvf trivy.tar.gz && \
     mv trivy /usr/local/bin/trivy && \
     rm trivy.tar.gz
