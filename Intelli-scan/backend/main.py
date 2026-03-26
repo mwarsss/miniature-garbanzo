@@ -4,6 +4,8 @@ import json
 import os
 import shutil
 import time
+import asyncio
+from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
@@ -11,7 +13,8 @@ from git import Repo, GitCommandError
 from typing import Dict, List, Optional
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+from google import genai
+from google.genai import types as genai_types
 import datetime
 from pypdf import PdfReader
 import io
@@ -87,11 +90,12 @@ app.add_middleware(
 
 # --- Google Generative AI Configuration ---
 if settings.google_api_key:
-    genai.configure(api_key=settings.google_api_key)
-    model = genai.GenerativeModel(settings.ai_model_name)
+    genai_client = genai.Client(api_key=settings.google_api_key)
+    model = settings.ai_model_name  # model name string, used in client calls
     logger.info(f"✅ Gemini AI configured with model: {settings.ai_model_name}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")
+    genai_client = None
     model = None
 
 # --- Pydantic Models ---
@@ -217,7 +221,7 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[
     start_time = time.time()
     
     try:
-        policy_context = get_policy_context()
+        policy_context = await run_in_threadpool(get_policy_context)
         prompt = f"""
     As an expert security analyst, analyze the following scan results.
     Your response MUST be contextualized by the internal security policies provided.
@@ -248,10 +252,13 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[
     """
         
         # Use circuit breaker for AI calls
-        def call_ai():
-            return model.generate_content(prompt)
+        async def call_ai():
+            return await genai_client.aio.models.generate_content(
+                model=model,
+                contents=prompt
+            )
         
-        response = gemini_circuit_breaker.call(call_ai)
+        response = await gemini_circuit_breaker.async_call(call_ai)
         
         # Clean and parse response
         response_text = response.text.strip()
@@ -289,7 +296,7 @@ async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Option
     start_time = time.time()
     
     try:
-        policy_context = get_policy_context()
+        policy_context = await run_in_threadpool(get_policy_context)
         prompt = f"""
     As a senior software security engineer, create a remediation plan based on the scan results.
     Your fixes and explanations MUST align with the provided internal security policies.
@@ -316,10 +323,13 @@ async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Option
     }}
     """
         
-        def call_ai():
-            return model.generate_content(prompt)
+        async def call_ai():
+            return await genai_client.aio.models.generate_content(
+                model=model,
+                contents=prompt
+            )
         
-        response = gemini_circuit_breaker.call(call_ai)
+        response = await gemini_circuit_breaker.async_call(call_ai)
         
         # Clean and parse response
         response_text = response.text.strip()
@@ -348,7 +358,7 @@ async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Option
 
 # --- Scanner Helper Functions ---
 @handle_errors
-def _run_trivy_scan(directory: str) -> dict:
+async def _run_trivy_scan(directory: str) -> dict:
     """Runs Trivy filesystem scan with optimizations and error handling."""
     start_time = time.time()
     
@@ -363,32 +373,43 @@ def _run_trivy_scan(directory: str) -> dict:
             "--skip-dirs", os.path.join(directory, ".git"),
         ]
         
-        process = subprocess.run(
-            trivy_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=settings.scan_timeout_minutes * 60
+        process = await asyncio.create_subprocess_exec(
+            *trivy_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(
+                process.communicate(),
+                timeout=settings.scan_timeout_minutes * 60
+            )
+            stdout = stdout_data.decode() if stdout_data else ""
+            stderr = stderr_data.decode() if stderr_data else ""
+            returncode = process.returncode
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise subprocess.TimeoutExpired(trivy_cmd, settings.scan_timeout_minutes * 60)
 
         duration_ms = (time.time() - start_time) * 1000
         
-        if process.returncode != 0:
-            logger.error(f"Trivy scan failed. Stderr: {process.stderr}")
+        if returncode != 0:
+            logger.error(f"Trivy scan failed. Stderr: {stderr}")
             metrics.increment("scans.trivy.failures")
             
             # Try to parse stdout anyway, it might contain partial results
             try:
-                result = json.loads(process.stdout) if process.stdout else {
-                    "error": f"Trivy scan failed. Stderr: {process.stderr}"
+                result = json.loads(stdout) if stdout else {
+                    "error": f"Trivy scan failed. Stderr: {stderr}"
                 }
                 metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "partial"})
                 return result
             except json.JSONDecodeError:
                 metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "failed"})
-                raise ScannerError(f"Trivy scan failed and output was not valid JSON. Stderr: {process.stderr}")
+                raise ScannerError(f"Trivy scan failed and output was not valid JSON. Stderr: {stderr}")
         
-        result = json.loads(process.stdout) if process.stdout else {}
+        result = json.loads(stdout) if stdout else {}
         metrics.increment("scans.trivy.success")
         metrics.histogram("scans.trivy.duration_ms", duration_ms, {"status": "success"})
         logger.info(f"Trivy scan completed in {duration_ms:.2f}ms")
@@ -409,7 +430,7 @@ def _run_trivy_scan(directory: str) -> dict:
         raise ScannerError(f"Trivy scan error: {str(e)}")
 
 @handle_errors
-def _run_semgrep_scan(directory: str) -> dict:
+async def _run_semgrep_scan(directory: str) -> dict:
     """Runs Semgrep scan with optimizations and error handling."""
     start_time = time.time()
     
@@ -426,22 +447,33 @@ def _run_semgrep_scan(directory: str) -> dict:
             directory
         ]
         
-        process = subprocess.run(
-            semgrep_cmd,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=settings.scan_timeout_minutes * 60
+        process = await asyncio.create_subprocess_exec(
+            *semgrep_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
         )
+
+        try:
+            stdout_data, stderr_data = await asyncio.wait_for(
+                process.communicate(),
+                timeout=settings.scan_timeout_minutes * 60
+            )
+            stdout = stdout_data.decode() if stdout_data else ""
+            stderr = stderr_data.decode() if stderr_data else ""
+            returncode = process.returncode
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise subprocess.TimeoutExpired(semgrep_cmd, settings.scan_timeout_minutes * 60)
 
         duration_ms = (time.time() - start_time) * 1000
 
-        if process.returncode != 0:
-            logger.warning(f"Semgrep scan returned non-zero exit code. Stderr: {process.stderr}")
+        if returncode != 0:
+            logger.warning(f"Semgrep scan returned non-zero exit code. Stderr: {stderr}")
             metrics.increment("scans.semgrep.warnings")
 
-        result = json.loads(process.stdout) if process.stdout else {
-            "error": process.stderr or "Semgrep returned no output."
+        result = json.loads(stdout) if stdout else {
+            "error": stderr or "Semgrep returned no output."
         }
         
         metrics.increment("scans.semgrep.success")
@@ -537,46 +569,62 @@ def generate_markdown_report(scan: dict) -> str:
 
 # --- Background Scan Task ---
 async def _perform_scan(scan_uuid: str, repo_url: str):
-    def update_status(status: str, message: Optional[str] = None):
-        with db_pool.get_cursor() as cur:
-            cur.execute("UPDATE scans SET status = %s WHERE uuid = %s", (status, scan_uuid))
+    async def update_status(status: str, message: Optional[str] = None):
+        def _update():
+            with db_pool.get_cursor() as cur:
+                if message:
+                    cur.execute("UPDATE scans SET status = %s, error_message = %s WHERE uuid = %s", (status, message, scan_uuid))
+                else:
+                    cur.execute("UPDATE scans SET status = %s WHERE uuid = %s", (status, scan_uuid))
+        await run_in_threadpool(_update)
 
-    update_status("processing")
+    await update_status("processing")
+
+    # Use run_in_threadpool for blocking git operations
+    def clone_repo(url, path):
+        return Repo.clone_from(url, path, depth=1)
 
     with tempfile.TemporaryDirectory() as temp_dir:
         try:
-            Repo.clone_from(repo_url, temp_dir, depth=1)
-        except GitCommandError as e:
+            await run_in_threadpool(clone_repo, repo_url, temp_dir)
+        except Exception as e:
             logger.error(f"[{scan_uuid}] Git clone error: {e}")
-            update_status("failed")
+            await update_status("failed", f"Git clone error: {str(e)}")
             return
 
-        sca_result = _run_trivy_scan(temp_dir)
-        sast_result = _run_semgrep_scan(temp_dir)
-        ai_analysis_result = await _perform_ai_analysis(sca_result, sast_result)
+        try:
+            sca_result = await _run_trivy_scan(temp_dir)
+            sast_result = await _run_semgrep_scan(temp_dir)
+            ai_analysis_result = await _perform_ai_analysis(sca_result, sast_result)
 
-        with db_pool.get_cursor() as cur:
-            cur.execute(
-                """
-                UPDATE scans
-                SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s, finished_at = %s
-                WHERE uuid = %s
-                """,
-                (
-                    "completed",
-                    json.dumps(sca_result),
-                    json.dumps(sast_result),
-                    ai_analysis_result.model_dump_json() if ai_analysis_result else None,
-                    datetime.datetime.now(datetime.timezone.utc),
-                    scan_uuid
-                )
-            )
+            def save_results():
+                with db_pool.get_cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE scans
+                        SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s, finished_at = %s
+                        WHERE uuid = %s
+                        """,
+                        (
+                            "completed",
+                            json.dumps(sca_result),
+                            json.dumps(sast_result),
+                            ai_analysis_result.model_dump_json() if ai_analysis_result else None,
+                            datetime.datetime.now(datetime.timezone.utc),
+                            scan_uuid
+                        )
+                    )
+            await run_in_threadpool(save_results)
+        except Exception as e:
+            logger.error(f"[{scan_uuid}] Scan failed: {e}")
+            await update_status("failed", f"Scan error: {str(e)}")
+            return
 
     logger.info(f"[{scan_uuid}] Scan completed and saved to database.")
 
 # --- API Endpoints ---
 @app.post("/scan", status_code=202)
-async def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
+def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     scan_uuid = uuid.uuid4()
     with db_pool.get_cursor() as cur:
         cur.execute(
@@ -613,9 +661,11 @@ async def get_remediation_plan(scan_id: str):
         
     try:
         scan_id_int = int(scan_id)
-        with db_pool.get_cursor() as cur:
-            cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE id = %s", (scan_id_int,))
-            scan = cur.fetchone()
+        def fetch_scan():
+            with db_pool.get_cursor() as cur:
+                cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE id = %s", (scan_id_int,))
+                return cur.fetchone()
+        scan = await run_in_threadpool(fetch_scan)
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid scan ID format. Must be an integer.")
     except Exception as e:
@@ -633,10 +683,10 @@ async def get_remediation_plan(scan_id: str):
     return remediation_plan
 
 @app.get("/scan/{scan_id}", response_model=ScanStatus)
-async def get_scan_status(scan_id: uuid.UUID):
+def get_scan_status(scan_id: uuid.UUID):
     try:
         with db_pool.get_cursor() as cur:
-            cur.execute("SELECT status, sca_result, sast_result, ai_analysis FROM scans WHERE uuid = %s", (str(scan_id),))
+            cur.execute("SELECT status, sca_result, sast_result, ai_analysis, error_message FROM scans WHERE uuid = %s", (str(scan_id),))
             scan = cur.fetchone()
     except Exception as e:
         logger.error(f"Error fetching scan status: {e}")
@@ -647,6 +697,7 @@ async def get_scan_status(scan_id: uuid.UUID):
 
     return ScanStatus(
         status=scan['status'],
+        message=scan.get('error_message'),
         result=ScanResultData(
             sca=scan['sca_result'],
             sast=scan['sast_result'],
@@ -658,15 +709,18 @@ async def get_scan_status(scan_id: uuid.UUID):
 async def upload_policy_document(file: UploadFile = File(...)):
     """Uploads a policy document (PDF or TXT) and stores its content."""
     filename = file.filename
-    content = ""
     
     try:
         if filename.lower().endswith(".pdf"):
             pdf_content = await file.read()
-            pdf_file = io.BytesIO(pdf_content)
-            reader = PdfReader(pdf_file)
-            for page in reader.pages:
-                content += page.extract_text()
+            def extract_pdf_content(data):
+                content = ""
+                pdf_file = io.BytesIO(data)
+                reader = PdfReader(pdf_file)
+                for page in reader.pages:
+                    content += page.extract_text()
+                return content
+            content = await run_in_threadpool(extract_pdf_content, pdf_content)
         elif filename.lower().endswith(".txt"):
             content_bytes = await file.read()
             content = content_bytes.decode("utf-8")
@@ -676,13 +730,15 @@ async def upload_policy_document(file: UploadFile = File(...)):
         if not content.strip():
             raise HTTPException(status_code=400, detail="The uploaded document is empty or could not be read.")
 
-        with db_pool.get_cursor() as cur:
-            # Simple approach: replace the document if it already exists to avoid duplicates
-            cur.execute("DELETE FROM policy_documents WHERE filename = %s", (filename,))
-            cur.execute(
-                "INSERT INTO policy_documents (filename, content) VALUES (%s, %s)",
-                (filename, content)
-            )
+        def save_policy():
+            with db_pool.get_cursor() as cur:
+                # Simple approach: replace the document if it already exists to avoid duplicates
+                cur.execute("DELETE FROM policy_documents WHERE filename = %s", (filename,))
+                cur.execute(
+                    "INSERT INTO policy_documents (filename, content) VALUES (%s, %s)",
+                    (filename, content)
+                )
+        await run_in_threadpool(save_policy)
 
         return {"status": "success", "filename": filename, "chars_read": len(content)}
     
@@ -750,7 +806,7 @@ def list_reports(limit: int = 50):
                 raise HTTPException(status_code=500, detail="Database error.")
         
 @app.get("/scan/{scan_uuid}/remediation-pdf")
-async def generate_remediation_pdf(scan_uuid: str):
+def generate_remediation_pdf(scan_uuid: str):
     # 1. Fetch Raw Data from DB (The "Neat" Source)
     try:
         with db_pool.get_cursor() as cur:
@@ -779,11 +835,14 @@ async def generate_remediation_pdf(scan_uuid: str):
     """
     
     # Check if model is loaded (from your existing code)
-    if not model:
+    if not genai_client or not model:
         ai_text = "AI Module not configured. Showing raw data summary."
     else:
         try:
-            response = await model.generate_content_async(prompt)
+            response = genai_client.models.generate_content(
+                model=model,
+                contents=prompt
+            )
             ai_text = response.text
         except Exception as e:
             ai_text = f"AI Generation Failed: {str(e)}"
@@ -843,7 +902,7 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
         logger.warning("AI model not configured. Skipping Trivy remediation.")
         return None
 
-    policy_context = get_policy_context()
+    policy_context = await run_in_threadpool(get_policy_context)
     prompt = f"""
     As a senior software security engineer, create a prioritized, actionable remediation plan 
     based on the provided Trivy vulnerability scan report. Your response MUST be tailored for 
@@ -866,7 +925,10 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
     Format your response as a single JSON object under a 'remediations' key.
     """
     try:
-        response = await model.generate_content_async(prompt)
+        response = await genai_client.aio.models.generate_content(
+            model=model,
+            contents=prompt
+        )
         # It's common for the model to wrap its JSON in markdown, so we strip it.
         cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
         parsed_output = json.loads(cleaned_response)
@@ -882,9 +944,10 @@ async def get_trivy_remediation_plan():
     Reads the Trivy report, generates a remediation plan via AI, and returns it.
     """
     try:
-        # Assuming report_trivy.json is in the same directory as main.py
-        with open("report_trivy.json", "r") as f:
-            trivy_data = json.load(f)
+        def load_trivy_report():
+            with open("report_trivy.json", "r") as f:
+                return json.load(f)
+        trivy_data = await run_in_threadpool(load_trivy_report)
     except FileNotFoundError:
         raise HTTPException(status_code=404, detail="report_trivy.json not found in the backend directory.")
     except json.JSONDecodeError:
