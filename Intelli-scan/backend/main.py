@@ -595,7 +595,13 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
         try:
             sca_result = await _run_trivy_scan(temp_dir)
             sast_result = await _run_semgrep_scan(temp_dir)
-            ai_analysis_result = await _perform_ai_analysis(sca_result, sast_result)
+            
+            # AI analysis is now optional - don't fail the whole scan if it hits a quota/error
+            ai_analysis_result = None
+            try:
+                ai_analysis_result = await _perform_ai_analysis(sca_result, sast_result)
+            except Exception as ai_err:
+                logger.warning(f"[{scan_uuid}] AI analysis skipped due to error (likely quota): {ai_err}")
 
             def save_results():
                 with db_pool.get_cursor() as cur:
@@ -616,7 +622,7 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
                     )
             await run_in_threadpool(save_results)
         except Exception as e:
-            logger.error(f"[{scan_uuid}] Scan failed: {e}")
+            logger.error(f"[{scan_uuid}] Core scan logic failed: {e}")
             await update_status("failed", f"Scan error: {str(e)}")
             return
 
