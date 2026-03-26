@@ -4,7 +4,7 @@ fastapi
 uvicorn
 python-dotenv
 GitPython
-google-generativeai
+google-genai
 google-api-python-client
 psycopg2-binary
 semgrep

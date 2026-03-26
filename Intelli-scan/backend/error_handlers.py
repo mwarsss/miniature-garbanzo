@@ -73,6 +73,33 @@ class CircuitBreaker:
             
             raise
 
+    async def async_call(self, func: Callable, *args, **kwargs) -> Any:
+        """Execute async function with circuit breaker protection."""
+        
+        if self.state == "open":
+            if time.time() - self.last_failure_time > self.timeout:
+                self.state = "half-open"
+                logger.info("Circuit breaker entering half-open state")
+            else:
+                raise Exception("Circuit breaker is OPEN - service unavailable")
+        
+        try:
+            result = await func(*args, **kwargs)
+            if self.state == "half-open":
+                self.state = "closed"
+                self.failure_count = 0
+                logger.info("Circuit breaker closed - service recovered")
+            return result
+        except Exception as e:
+            self.failure_count += 1
+            self.last_failure_time = time.time()
+            
+            if self.failure_count >= self.failure_threshold:
+                self.state = "open"
+                logger.error(f"Circuit breaker OPENED after {self.failure_count} failures")
+            
+            raise
+
 
 # Retry decorator for transient failures
 def retry_on_failure(max_attempts: int = 3, min_wait: int = 2, max_wait: int = 10):

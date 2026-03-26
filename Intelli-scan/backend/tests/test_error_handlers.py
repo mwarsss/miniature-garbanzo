@@ -70,6 +70,39 @@ def test_circuit_breaker_half_open_recovery():
     assert cb.state == "closed"
 
 
+@pytest.mark.asyncio
+async def test_circuit_breaker_async_call():
+    """Test circuit breaker async_call method."""
+    cb = CircuitBreaker(failure_threshold=3, timeout=1)
+    
+    async def successful_async_function():
+        return "success"
+    
+    result = await cb.async_call(successful_async_function)
+    assert result == "success"
+    assert cb.state == "closed"
+
+
+@pytest.mark.asyncio
+async def test_circuit_breaker_async_opens_after_failures():
+    """Test circuit breaker opens after threshold failures using async calls."""
+    cb = CircuitBreaker(failure_threshold=2, timeout=1)
+    
+    async def failing_async_function():
+        raise Exception("Test failure")
+    
+    # Fail 2 times to open circuit
+    for _ in range(2):
+        with pytest.raises(Exception):
+            await cb.async_call(failing_async_function)
+    
+    assert cb.state == "open"
+    
+    # Next call should fail immediately
+    with pytest.raises(Exception, match="Circuit breaker is OPEN"):
+        await cb.async_call(failing_async_function)
+
+
 def test_retry_decorator_success():
     """Test retry decorator with successful function."""
     call_count = 0
