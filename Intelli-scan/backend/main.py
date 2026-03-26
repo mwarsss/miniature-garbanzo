@@ -205,7 +205,7 @@ def get_policy_context() -> str:
         for policy in policies:
             context += f"--- Document: {policy['filename']} ---\n"
             context += f"{policy['content']}\n\n"
-        return context
+        return context[:15000] # Limit to 15,000 chars to avoid hitting token limits
     except Exception as e:
         logger.error(f"Could not retrieve policy context: {e}")
         return "Error retrieving security policies."
@@ -665,6 +665,11 @@ async def get_remediation_plan(scan_id: str):
     if not model:
         raise HTTPException(status_code=500, detail="AI model is not configured. GOOGLE_API_KEY may be missing.")
         
+    cache_key = f"remediation_plan_{scan_id}"
+    cached_plan = cache.get(cache_key)
+    if cached_plan:
+        return RemediationResult(**cached_plan)
+        
     try:
         scan_id_int = int(scan_id)
         def fetch_scan():
@@ -686,6 +691,8 @@ async def get_remediation_plan(scan_id: str):
     remediation_plan = await _perform_ai_remediation(scan['sca_result'], scan['sast_result'])
     if not remediation_plan:
         raise HTTPException(status_code=500, detail="Failed to generate remediation plan.")
+        
+    cache.set(cache_key, remediation_plan.model_dump(), ttl=86400)
     return remediation_plan
 
 @app.get("/scan/{scan_id}", response_model=ScanStatus)
@@ -828,30 +835,37 @@ def generate_remediation_pdf(scan_uuid: str):
 
     # 2. Ask Gemini for the Patching Plan
     # (We are skipping the intermediate 'Markdown' step and going straight to the solution)
-    prompt = f"""
-    You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}    
-    DATA SOURCES:
-    - SCA (Dependencies): {json.dumps(scan['sca_result'])[:10000]} 
-    - SAST (Code): {json.dumps(scan['sast_result'])[:10000]}
-
-    OUTPUT FORMAT:
-    Provide a professional, step-by-step patching guide. 
-    Focus ONLY on High/Critical severities.
-    Do not use Markdown formatting (like **bold**), just plain text with clear headers.
-    """
+    cache_key = f"remediation_pdf_text_{scan_uuid}"
+    cached_text = cache.get(cache_key)
     
-    # Check if model is loaded (from your existing code)
-    if not genai_client or not model:
-        ai_text = "AI Module not configured. Showing raw data summary."
+    if cached_text:
+        ai_text = cached_text
     else:
-        try:
-            response = genai_client.models.generate_content(
-                model=model,
-                contents=prompt
-            )
-            ai_text = response.text
-        except Exception as e:
-            ai_text = f"AI Generation Failed: {str(e)}"
+        prompt = f"""
+        You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}    
+        DATA SOURCES:
+        - SCA (Dependencies): {json.dumps(scan['sca_result'])[:10000]} 
+        - SAST (Code): {json.dumps(scan['sast_result'])[:10000]}
+
+        OUTPUT FORMAT:
+        Provide a professional, step-by-step patching guide. 
+        Focus ONLY on High/Critical severities.
+        Do not use Markdown formatting (like **bold**), just plain text with clear headers.
+        """
+        
+        # Check if model is loaded (from your existing code)
+        if not genai_client or not model:
+            ai_text = "AI Module not configured. Showing raw data summary."
+        else:
+            try:
+                response = genai_client.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+                ai_text = response.text
+                cache.set(cache_key, ai_text, ttl=86400)
+            except Exception as e:
+                ai_text = f"AI Generation Failed: {str(e)}"
 
     # 3. Generate PDF in Memory
     buffer = io.BytesIO()
