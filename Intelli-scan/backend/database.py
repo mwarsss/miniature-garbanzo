@@ -89,6 +89,16 @@ def create_tables(database_url: str):
             );
         """)
         
+        # Ensure error_message column exists for older table versions
+        cur.execute("""
+            DO $$ 
+            BEGIN 
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scans' AND column_name='error_message') THEN
+                    ALTER TABLE scans ADD COLUMN error_message TEXT;
+                END IF;
+            END $$;
+        """)
+        
         # Create indexes for performance
         cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_scans_uuid ON scans(uuid);
