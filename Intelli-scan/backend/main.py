@@ -89,14 +89,20 @@ app.add_middleware(
 )
 
 # --- Google Generative AI Configuration ---
-if settings.google_api_key:
-    genai_client = genai.Client(api_key=settings.google_api_key)
-    model = settings.ai_model_name  # model name string, used in client calls
-    logger.info(f"✅ Gemini AI configured with model: {settings.ai_model_name}")
+ai_clients = []
+if settings.google_api_keys:
+    for key in settings.google_api_keys:
+        ai_clients.append(genai.Client(api_key=key))
+    
+    # Legacy support for code still using genai_client
+    genai_client = ai_clients[0]
+    model = settings.ai_model_name
+    logger.info(f"✅ Gemini AI configured with {len(ai_clients)} keys and model: {settings.ai_model_name}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")
     genai_client = None
     model = None
+    ai_clients = []
 
 # --- Pydantic Models ---
 class Vulnerability(BaseModel):
@@ -213,147 +219,170 @@ def get_policy_context() -> str:
 @retry_on_failure(max_attempts=settings.ai_max_retries)
 @handle_errors
 async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[AIAnalysisResult]:
-    """Perform AI analysis with retry logic and circuit breaker."""
-    if not model:
+    """Perform AI analysis with retry logic and multi-key rotation."""
+    if not ai_clients:
         logger.warning("AI model not configured, skipping analysis")
         return None
     
     start_time = time.time()
     
-    try:
-        policy_context = await run_in_threadpool(get_policy_context)
-        prompt = f"""
-    As an expert security analyst, analyze the following scan results.
-    Your response MUST be contextualized by the internal security policies provided.
-    Instead of generic advice, reference specific policy documents or sections where applicable.
+    policy_context = await run_in_threadpool(get_policy_context)
+    prompt = f"""
+As an expert security analyst, analyze the following scan results.
+Your response MUST be contextualized by the internal security policies provided.
+Instead of generic advice, reference specific policy documents or sections where applicable.
 
-    {policy_context}
+{policy_context}
 
-    ### Security Scan Results ###
-    SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
-    SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
+### Security Scan Results ###
+SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
+SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
 
-    Generate a JSON response with an executive summary and the top 3 vulnerabilities,
-    linking them to the policies. For example, if a policy requires MFA, and a finding
-    relates to weak authentication, your POC should mention the specific policy.
+Generate a JSON response with an executive summary and the top 3 vulnerabilities,
+linking them to the policies. For example, if a policy requires MFA, and a finding
+relates to weak authentication, your POC should mention the specific policy.
+
+Format your response as a single JSON object with this exact structure:
+{{
+    "summary": "Executive summary here",
+    "top_vulnerabilities": [
+        {{
+            "name": "Vulnerability name",
+            "severity": "HIGH",
+            "file": "filename.js",
+            "poc": "Proof of concept"
+        }}
+    ]
+}}
+"""
     
-    Format your response as a single JSON object with this exact structure:
-    {{
-        "summary": "Executive summary here",
-        "top_vulnerabilities": [
-            {{
-                "name": "Vulnerability name",
-                "severity": "HIGH",
-                "file": "filename.js",
-                "poc": "Proof of concept"
-            }}
-        ]
-    }}
-    """
-        
-        # Use circuit breaker for AI calls
-        async def call_ai():
-            return await genai_client.aio.models.generate_content(
-                model=model,
-                contents=prompt
-            )
-        
-        response = await gemini_circuit_breaker.async_call(call_ai)
-        
-        # Clean and parse response
-        response_text = response.text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        response_text = response_text.strip()
-        
-        parsed_output = json.loads(response_text)
-        result = AIAnalysisResult(**parsed_output)
-        
-        # Track metrics
-        duration_ms = (time.time() - start_time) * 1000
-        track_ai_metrics("analysis", True, duration_ms)
-        
-        logger.info(f"AI analysis completed in {duration_ms:.2f}ms")
-        return result
-        
-    except Exception as e:
-        duration_ms = (time.time() - start_time) * 1000
-        track_ai_metrics("analysis", False, duration_ms)
-        logger.error(f"AI analysis failed after {duration_ms:.2f}ms: {e}")
-        raise AIAnalysisError(f"AI analysis failed: {str(e)}")
+    last_error = None
+    for i, client in enumerate(ai_clients):
+        try:
+            # Use circuit breaker for AI calls
+            async def call_ai():
+                return await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+            
+            response = await gemini_circuit_breaker.async_call(call_ai)
+            
+            # Clean and parse response
+            response_text = response.text.strip()
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            parsed_output = json.loads(response_text)
+            result = AIAnalysisResult(**parsed_output)
+            
+            # Track metrics
+            duration_ms = (time.time() - start_time) * 1000
+            track_ai_metrics("analysis", True, duration_ms)
+            
+            logger.info(f"AI analysis completed in {duration_ms:.2f}ms using key #{i+1}")
+            return result
+            
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            # If it's a quota error (429), try the next key
+            if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
+                logger.warning(f"Quota exceeded for API key #{i+1}, trying next key...")
+                continue
+            else:
+                # For other errors, let the retry decorator handle it or fail
+                break
+    
+    # If we get here, all keys failed or we hit a non-quota error
+    duration_ms = (time.time() - start_time) * 1000
+    track_ai_metrics("analysis", False, duration_ms)
+    logger.error(f"AI analysis failed after trying all available keys: {last_error}")
+    raise AIAnalysisError(f"AI analysis failed: {str(last_error)}")
 
 
 @retry_on_failure(max_attempts=settings.ai_max_retries)
 @handle_errors
 async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[RemediationResult]:
-    """Generate remediation plan with retry logic and circuit breaker."""
-    if not model:
+    """Generate remediation plan with retry logic and multi-key rotation."""
+    if not ai_clients:
         logger.warning("AI model not configured, skipping remediation")
         return None
     
     start_time = time.time()
     
-    try:
-        policy_context = await run_in_threadpool(get_policy_context)
-        prompt = f"""
-    As a senior software security engineer, create a remediation plan based on the scan results.
-    Your fixes and explanations MUST align with the provided internal security policies.
-    Reference the policies to justify your proposed code changes.
+    policy_context = await run_in_threadpool(get_policy_context)
+    prompt = f"""
+As a senior software security engineer, create a remediation plan based on the scan results.
+Your fixes and explanations MUST align with the provided internal security policies.
+Reference the policies to justify your proposed code changes.
 
-    {policy_context}
+{policy_context}
 
-    ### Security Scan Results ###
-    SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
-    SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
+### Security Scan Results ###
+SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
+SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
 
-    Generate a JSON object containing a list of remediation steps. Each step must include
-    the issue, the exact code fix, and an explanation that references the relevant internal policy.
+Generate a JSON object containing a list of remediation steps. Each step must include
+the issue, the exact code fix, and an explanation that references the relevant internal policy.
 
-    Format your response as a single JSON object with this exact structure:
-    {{
-        "remediations": [
-            {{
-                "issue": "Issue name",
-                "fix_code": "Code fix here",
-                "explanation": "Why this fixes it"
-            }}
-        ]
-    }}
-    """
-        
-        async def call_ai():
-            return await genai_client.aio.models.generate_content(
-                model=model,
-                contents=prompt
-            )
-        
-        response = await gemini_circuit_breaker.async_call(call_ai)
-        
-        # Clean and parse response
-        response_text = response.text.strip()
-        if response_text.startswith("```json"):
-            response_text = response_text[7:]
-        if response_text.endswith("```"):
-            response_text = response_text[:-3]
-        response_text = response_text.strip()
-        
-        parsed_output = json.loads(response_text)
-        result = RemediationResult(**parsed_output)
-        
-        # Track metrics
-        duration_ms = (time.time() - start_time) * 1000
-        track_ai_metrics("remediation", True, duration_ms)
-        
-        logger.info(f"AI remediation completed in {duration_ms:.2f}ms")
-        return result
-        
-    except Exception as e:
-        duration_ms = (time.time() - start_time) * 1000
-        track_ai_metrics("remediation", False, duration_ms)
-        logger.error(f"AI remediation failed after {duration_ms:.2f}ms: {e}")
-        raise AIAnalysisError(f"AI remediation failed: {str(e)}")
+Format your response as a single JSON object with this exact structure:
+{{
+    "remediations": [
+        {{
+            "issue": "Issue name",
+            "fix_code": "Code fix here",
+            "explanation": "Why this fixes it"
+        }}
+    ]
+}}
+"""
+    
+    last_error = None
+    for i, client in enumerate(ai_clients):
+        try:
+            async def call_ai():
+                return await client.aio.models.generate_content(
+                    model=model,
+                    contents=prompt
+                )
+            
+            response = await gemini_circuit_breaker.async_call(call_ai)
+            
+            # Clean and parse response
+            response_text = response.text.strip()
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            parsed_output = json.loads(response_text)
+            result = RemediationResult(**parsed_output)
+            
+            # Track metrics
+            duration_ms = (time.time() - start_time) * 1000
+            track_ai_metrics("remediation", True, duration_ms)
+            
+            logger.info(f"AI remediation completed in {duration_ms:.2f}ms using key #{i+1}")
+            return result
+            
+        except Exception as e:
+            last_error = e
+            error_str = str(e).lower()
+            if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
+                logger.warning(f"Quota exceeded for API key #{i+1}, trying next key...")
+                continue
+            else:
+                break
+                
+    duration_ms = (time.time() - start_time) * 1000
+    track_ai_metrics("remediation", False, duration_ms)
+    logger.error(f"AI remediation failed after trying all available keys: {last_error}")
+    raise AIAnalysisError(f"AI remediation failed: {str(last_error)}")
 
 
 # --- Scanner Helper Functions ---
@@ -916,9 +945,9 @@ def download_report(report_id: int):
 
 async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
     """
-    Performs AI-powered remediation analysis on a Trivy JSON report.
+    Performs AI-powered remediation analysis on a Trivy JSON report with multi-key rotation.
     """
-    if not model:
+    if not ai_clients:
         logger.warning("AI model not configured. Skipping Trivy remediation.")
         return None
 
@@ -944,19 +973,28 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
 
     Format your response as a single JSON object under a 'remediations' key.
     """
-    try:
-        response = await genai_client.aio.models.generate_content(
-            model=model,
-            contents=prompt
-        )
-        # It's common for the model to wrap its JSON in markdown, so we strip it.
-        cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
-        parsed_output = json.loads(cleaned_response)
-        return RemediationResult(**parsed_output)
-    except Exception as e:
-        logger.error(f"AI Trivy remediation failed: {e}")
-        logger.error(f"Raw AI response that caused error: {response.text if 'response' in locals() else 'N/A'}")
-        return None
+    
+    for i, client in enumerate(ai_clients):
+        try:
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=prompt
+            )
+            # It's common for the model to wrap its JSON in markdown, so we strip it.
+            cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
+            parsed_output = json.loads(cleaned_response)
+            logger.info(f"Trivy remediation completed using key #{i+1}")
+            return RemediationResult(**parsed_output)
+        except Exception as e:
+            error_str = str(e).lower()
+            if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
+                logger.warning(f"Quota exceeded for API key #{i+1} during Trivy remediation, trying next key...")
+                continue
+            else:
+                logger.error(f"AI Trivy remediation failed: {e}")
+                break
+    
+    return None
 
 @app.get("/trivy_remediation", response_model=Optional[RemediationResult])
 async def get_trivy_remediation_plan():

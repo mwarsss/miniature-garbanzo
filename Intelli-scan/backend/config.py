@@ -15,6 +15,13 @@ class Settings(BaseSettings):
     # API Keys
     google_api_key: str
     
+    @property
+    def google_api_keys(self) -> list[str]:
+        """Returns a list of Google API keys from the comma-separated string."""
+        if not self.google_api_key:
+            return []
+        return [k.strip() for k in self.google_api_key.split(",") if k.strip()]
+    
     # Scanner Paths
     trivy_path: str = "trivy"
     semgrep_path: str = "semgrep"
