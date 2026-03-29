@@ -146,5 +146,5 @@ def handle_errors(func: Callable) -> Callable:
 
 
 # Global circuit breakers for external services
-gemini_circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=60)
-scanner_circuit_breaker = CircuitBreaker(failure_threshold=3, timeout=30)
+gemini_circuit_breaker = CircuitBreaker(failure_threshold=10, timeout=10)
+scanner_circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=30)
