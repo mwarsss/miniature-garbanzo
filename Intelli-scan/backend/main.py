@@ -88,13 +88,16 @@ app.add_middleware(
 )
 
 # --- Google Generative AI Configuration ---
-ai_configs = []
+# Pre-create one model instance per API key to avoid race conditions.
+# genai.configure() sets a global key, which is unsafe in async contexts
+# where concurrent requests could overwrite each other's configured key.
+ai_models: list[genai.GenerativeModel] = []
 if settings.google_api_keys:
-    ai_configs = settings.google_api_keys
-    # Use priority key for initial setup
-    genai.configure(api_key=ai_configs[0])
     model_name = settings.ai_model_name
-    logger.info(f"✅ Gemini AI configured with {len(ai_configs)} keys and model: {model_name}")
+    for key in settings.google_api_keys:
+        genai.configure(api_key=key)
+        ai_models.append(genai.GenerativeModel(model_name))
+    logger.info(f"✅ Gemini AI configured with {len(ai_models)} model instances and model: {model_name}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")
     model_name = None
@@ -215,7 +218,7 @@ def get_policy_context() -> str:
 @handle_errors
 async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[AIAnalysisResult]:
     """Perform AI analysis with retry logic and multi-key rotation using older SDK."""
-    if not ai_configs:
+    if not ai_models:
         logger.warning("AI model not configured, skipping analysis")
         return None
     
@@ -251,18 +254,14 @@ Format your response as a single JSON object with this exact structure:
 """
     
     last_error = None
-    for i, api_key in enumerate(ai_configs):
+    for i, model in enumerate(ai_models):
         try:
-            # Configure with the current key
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            
             # Use circuit breaker for AI calls
-            async def call_ai():
-                return await model.generate_content_async(prompt)
-            
+            async def call_ai(m=model):
+                return await m.generate_content_async(prompt)
+
             response = await gemini_circuit_breaker.async_call(call_ai)
-            
+
             # Clean and parse response
             response_text = response.text.strip()
             if response_text.startswith("```json"):
@@ -270,22 +269,22 @@ Format your response as a single JSON object with this exact structure:
             if response_text.endswith("```"):
                 response_text = response_text[:-3]
             response_text = response_text.strip()
-            
+
             parsed_output = json.loads(response_text)
             result = AIAnalysisResult(**parsed_output)
-            
+
             # Track metrics
             duration_ms = (time.time() - start_time) * 1000
             track_ai_metrics("analysis", True, duration_ms)
-            
-            logger.info(f"AI analysis completed in {duration_ms:.2f}ms using key #{i+1}")
+
+            logger.info(f"AI analysis completed in {duration_ms:.2f}ms using model instance #{i+1}")
             return result
-            
+
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
             if "429" in error_str or "resource_exhausted" in error_str:
-                logger.warning(f"Quota exceeded for API key #{i+1}, trying next key...")
+                logger.warning(f"Quota exceeded for model instance #{i+1}, trying next...")
                 continue
             else:
                 break
@@ -300,7 +299,7 @@ Format your response as a single JSON object with this exact structure:
 @handle_errors
 async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[RemediationResult]:
     """Generate remediation plan with retry logic and multi-key rotation using older SDK."""
-    if not ai_configs:
+    if not ai_models:
         logger.warning("AI model not configured, skipping remediation")
         return None
     
@@ -333,17 +332,13 @@ Format your response as a single JSON object with this exact structure:
 """
     
     last_error = None
-    for i, api_key in enumerate(ai_configs):
+    for i, model in enumerate(ai_models):
         try:
-            # Configure with current key
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            
-            async def call_ai():
-                return await model.generate_content_async(prompt)
-            
+            async def call_ai(m=model):
+                return await m.generate_content_async(prompt)
+
             response = await gemini_circuit_breaker.async_call(call_ai)
-            
+
             # Clean and parse response
             response_text = response.text.strip()
             if response_text.startswith("```json"):
@@ -351,22 +346,22 @@ Format your response as a single JSON object with this exact structure:
             if response_text.endswith("```"):
                 response_text = response_text[:-3]
             response_text = response_text.strip()
-            
+
             parsed_output = json.loads(response_text)
             result = RemediationResult(**parsed_output)
-            
+
             # Track metrics
             duration_ms = (time.time() - start_time) * 1000
             track_ai_metrics("remediation", True, duration_ms)
-            
-            logger.info(f"AI remediation completed in {duration_ms:.2f}ms using key #{i+1}")
+
+            logger.info(f"AI remediation completed in {duration_ms:.2f}ms using model instance #{i+1}")
             return result
-            
+
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
             if "429" in error_str or "resource_exhausted" in error_str:
-                logger.warning(f"Quota exceeded for API key #{i+1}, trying next key...")
+                logger.warning(f"Quota exceeded for model instance #{i+1}, trying next...")
                 continue
             else:
                 break
@@ -683,7 +678,7 @@ def list_scans(limit: int = 50):
 
 @app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
 async def get_remediation_plan(scan_id: str):
-    if not model:
+    if not model_name:
         raise HTTPException(status_code=500, detail="AI model is not configured. GOOGLE_API_KEY may be missing.")
         
     cache_key = f"remediation_plan_{scan_id}"
@@ -875,14 +870,12 @@ def generate_remediation_pdf(scan_uuid: str):
         """
         
         # Check if model is loaded (from your existing code)
-        if not genai_client or not model:
+        if not model_name:
             ai_text = "AI Module not configured. Showing raw data summary."
         else:
             try:
-                response = genai_client.models.generate_content(
-                    model=model,
-                    contents=prompt
-                )
+                # Use the first pre-created model instance for synchronous report generation
+                response = ai_models[0].generate_content(prompt)
                 ai_text = response.text
                 cache.set(cache_key, ai_text, ttl=86400)
             except Exception as e:
@@ -939,7 +932,7 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
     """
     Performs AI-powered remediation analysis on a Trivy JSON report with multi-key rotation using older SDK.
     """
-    if not ai_configs:
+    if not ai_models:
         logger.warning("AI model not configured. Skipping Trivy remediation.")
         return None
 
@@ -966,22 +959,19 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
     Format your response as a single JSON object under a 'remediations' key.
     """
     
-    for i, api_key in enumerate(ai_configs):
+    for i, model in enumerate(ai_models):
         try:
-            genai.configure(api_key=api_key)
-            model = genai.GenerativeModel(model_name)
-            
             response = await model.generate_content_async(prompt)
-            
+
             # It's common for the model to wrap its JSON in markdown, so we strip it.
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
             parsed_output = json.loads(cleaned_response)
-            logger.info(f"Trivy remediation completed using key #{i+1}")
+            logger.info(f"Trivy remediation completed using model instance #{i+1}")
             return RemediationResult(**parsed_output)
         except Exception as e:
             error_str = str(e).lower()
             if "429" in error_str or "resource_exhausted" in error_str:
-                logger.warning(f"Quota exceeded for API key #{i+1} during Trivy remediation, trying next key...")
+                logger.warning(f"Quota exceeded for model instance #{i+1} during Trivy remediation, trying next...")
                 continue
             else:
                 logger.error(f"AI Trivy remediation failed: {e}")

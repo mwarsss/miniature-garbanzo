@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     max_concurrent_scans: int = 5
     
     # AI Configuration
-    ai_model_name: str = "gemini-2.0-flash-exp"
+    ai_model_name: str = "gemini-2.0-flash"
     ai_max_retries: int = 3
     ai_retry_delay_seconds: int = 2
     
