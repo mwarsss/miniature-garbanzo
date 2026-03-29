@@ -93,12 +93,20 @@ ai_clients = []
 if settings.google_api_keys:
     for key in settings.google_api_keys:
         # Use v1 for better stability and model availability
-        ai_clients.append(genai.Client(api_key=key, http_options={'api_version': 'v1'}))
-    
+        client = genai.Client(api_key=key, http_options={'api_version': 'v1'})
+        ai_clients.append(client)
+        
     # Legacy support for code still using genai_client
     genai_client = ai_clients[0]
     model = settings.ai_model_name
     logger.info(f"✅ Gemini AI configured with {len(ai_clients)} keys and model: {settings.ai_model_name}")
+    
+    # Debug: List available models
+    try:
+        models = [m.name for m in genai_client.models.list()]
+        logger.info(f"Available models: {models}")
+    except Exception as e:
+        logger.warning(f"Could not list models: {e}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")
     genai_client = None
