@@ -92,8 +92,8 @@ app.add_middleware(
 ai_clients = []
 if settings.google_api_keys:
     for key in settings.google_api_keys:
-        # Use v1 for better stability and model availability
-        client = genai.Client(api_key=key, http_options={'api_version': 'v1'})
+        # Let SDK handle API version defaults
+        client = genai.Client(api_key=key)
         ai_clients.append(client)
         
     # Legacy support for code still using genai_client
