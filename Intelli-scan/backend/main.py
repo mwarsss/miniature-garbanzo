@@ -13,8 +13,7 @@ from git import Repo, GitCommandError
 from typing import Dict, List, Optional
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
-from google import genai
-from google.genai import types as genai_types
+import google.generativeai as genai
 import datetime
 from pypdf import PdfReader
 import io
@@ -89,29 +88,16 @@ app.add_middleware(
 )
 
 # --- Google Generative AI Configuration ---
-ai_clients = []
+ai_configs = []
 if settings.google_api_keys:
-    for key in settings.google_api_keys:
-        # Let SDK handle API version defaults
-        client = genai.Client(api_key=key)
-        ai_clients.append(client)
-        
-    # Legacy support for code still using genai_client
-    genai_client = ai_clients[0]
-    model = settings.ai_model_name
-    logger.info(f"✅ Gemini AI configured with {len(ai_clients)} keys and model: {settings.ai_model_name}")
-    
-    # Debug: List available models
-    try:
-        models = [m.name for m in genai_client.models.list()]
-        logger.info(f"Available models: {models}")
-    except Exception as e:
-        logger.warning(f"Could not list models: {e}")
+    ai_configs = settings.google_api_keys
+    # Use priority key for initial setup
+    genai.configure(api_key=ai_configs[0])
+    model_name = settings.ai_model_name
+    logger.info(f"✅ Gemini AI configured with {len(ai_configs)} keys and model: {model_name}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")
-    genai_client = None
-    model = None
-    ai_clients = []
+    model_name = None
 
 # --- Pydantic Models ---
 class Vulnerability(BaseModel):
@@ -228,13 +214,12 @@ def get_policy_context() -> str:
 @retry_on_failure(max_attempts=settings.ai_max_retries)
 @handle_errors
 async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[AIAnalysisResult]:
-    """Perform AI analysis with retry logic and multi-key rotation."""
-    if not ai_clients:
+    """Perform AI analysis with retry logic and multi-key rotation using older SDK."""
+    if not ai_configs:
         logger.warning("AI model not configured, skipping analysis")
         return None
     
     start_time = time.time()
-    
     policy_context = await run_in_threadpool(get_policy_context)
     prompt = f"""
 As an expert security analyst, analyze the following scan results.
@@ -266,14 +251,15 @@ Format your response as a single JSON object with this exact structure:
 """
     
     last_error = None
-    for i, client in enumerate(ai_clients):
+    for i, api_key in enumerate(ai_configs):
         try:
+            # Configure with the current key
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            
             # Use circuit breaker for AI calls
             async def call_ai():
-                return await client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt
-                )
+                return await model.generate_content_async(prompt)
             
             response = await gemini_circuit_breaker.async_call(call_ai)
             
@@ -298,15 +284,12 @@ Format your response as a single JSON object with this exact structure:
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
-            # If it's a quota error (429), try the next key
-            if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
+            if "429" in error_str or "resource_exhausted" in error_str:
                 logger.warning(f"Quota exceeded for API key #{i+1}, trying next key...")
                 continue
             else:
-                # For other errors, let the retry decorator handle it or fail
                 break
     
-    # If we get here, all keys failed or we hit a non-quota error
     duration_ms = (time.time() - start_time) * 1000
     track_ai_metrics("analysis", False, duration_ms)
     logger.error(f"AI analysis failed after trying all available keys: {last_error}")
@@ -316,13 +299,12 @@ Format your response as a single JSON object with this exact structure:
 @retry_on_failure(max_attempts=settings.ai_max_retries)
 @handle_errors
 async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[RemediationResult]:
-    """Generate remediation plan with retry logic and multi-key rotation."""
-    if not ai_clients:
+    """Generate remediation plan with retry logic and multi-key rotation using older SDK."""
+    if not ai_configs:
         logger.warning("AI model not configured, skipping remediation")
         return None
     
     start_time = time.time()
-    
     policy_context = await run_in_threadpool(get_policy_context)
     prompt = f"""
 As a senior software security engineer, create a remediation plan based on the scan results.
@@ -351,13 +333,14 @@ Format your response as a single JSON object with this exact structure:
 """
     
     last_error = None
-    for i, client in enumerate(ai_clients):
+    for i, api_key in enumerate(ai_configs):
         try:
+            # Configure with current key
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            
             async def call_ai():
-                return await client.aio.models.generate_content(
-                    model=model,
-                    contents=prompt
-                )
+                return await model.generate_content_async(prompt)
             
             response = await gemini_circuit_breaker.async_call(call_ai)
             
@@ -382,7 +365,7 @@ Format your response as a single JSON object with this exact structure:
         except Exception as e:
             last_error = e
             error_str = str(e).lower()
-            if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
+            if "429" in error_str or "resource_exhausted" in error_str:
                 logger.warning(f"Quota exceeded for API key #{i+1}, trying next key...")
                 continue
             else:
@@ -954,9 +937,9 @@ def download_report(report_id: int):
 
 async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
     """
-    Performs AI-powered remediation analysis on a Trivy JSON report with multi-key rotation.
+    Performs AI-powered remediation analysis on a Trivy JSON report with multi-key rotation using older SDK.
     """
-    if not ai_clients:
+    if not ai_configs:
         logger.warning("AI model not configured. Skipping Trivy remediation.")
         return None
 
@@ -983,12 +966,13 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
     Format your response as a single JSON object under a 'remediations' key.
     """
     
-    for i, client in enumerate(ai_clients):
+    for i, api_key in enumerate(ai_configs):
         try:
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=prompt
-            )
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel(model_name)
+            
+            response = await model.generate_content_async(prompt)
+            
             # It's common for the model to wrap its JSON in markdown, so we strip it.
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
             parsed_output = json.loads(cleaned_response)
@@ -996,7 +980,7 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
             return RemediationResult(**parsed_output)
         except Exception as e:
             error_str = str(e).lower()
-            if "429" in error_str or "resource_exhausted" in error_str or "quota" in error_str:
+            if "429" in error_str or "resource_exhausted" in error_str:
                 logger.warning(f"Quota exceeded for API key #{i+1} during Trivy remediation, trying next key...")
                 continue
             else:
