@@ -559,7 +559,7 @@ function NavItem({ icon, label, href }: { icon: React.ReactNode; label: string; 
         ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
         : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
     }`}>
-      {React.cloneElement(icon as React.ReactElement, { size: 18 })}
+      {React.cloneElement(icon as React.ReactElement<{ size?: number }>, { size: 18 })}
       {label}
     </div>
   );

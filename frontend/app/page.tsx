@@ -2,6 +2,9 @@
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
+import AgentPipelineReceipt, {
+  type RemediationFinding,
+} from '@/components/AgentPipelineReceipt';
 import {
   Shield,
   Search,
@@ -51,6 +54,7 @@ export default function Dashboard() {
   const [currentScan, setCurrentScan] = useState<ScanResult | null>(null);
   const [aiAnalysis, setAiAnalysis] = useState<AIAnalysis | null>(null);
   const [remediationPlan, setRemediationPlan] = useState<Remediation[] | null>(null);
+  const [agenticResults, setAgenticResults] = useState<RemediationFinding[] | null>(null);
   const pathname = usePathname();
 
   // Handles initiating a scan via the backend API
@@ -60,6 +64,7 @@ export default function Dashboard() {
     setCurrentScan(null); // Clear previous scan results
     setAiAnalysis(null);
     setRemediationPlan(null);
+    setAgenticResults(null);
 
     try {
       const response = await fetch('https://intelli-scan-api-82554e007164.herokuapp.com/scan', {
@@ -89,7 +94,9 @@ export default function Dashboard() {
     }
   };
 
-  // Fetch remediation plan
+  // Fetch agentic remediation pipeline results
+  // The endpoint now returns a list of per-finding RemediationFinding objects
+  // (old `data.remediations` is undefined for the new format — modal stays hidden)
   const handleViewRemediation = async (scanId: string) => {
     try {
       const response = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${scanId}/remediation`);
@@ -97,7 +104,10 @@ export default function Dashboard() {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
       const data = await response.json();
-      setRemediationPlan(data.remediations);
+      // Legacy modal state — will be null since new format has no `.remediations` key
+      setRemediationPlan((data as { remediations?: Remediation[] }).remediations ?? null);
+      // Agentic pipeline receipt
+      setAgenticResults(Array.isArray(data) ? (data as RemediationFinding[]) : null);
     } catch (error) {
       console.error("Error fetching remediation plan:", error);
     }
@@ -340,6 +350,31 @@ export default function Dashboard() {
           </div>
         )}
 
+        {/* ── Agentic Remediation Pipeline ─────────────────────────────── */}
+        {agenticResults && currentScan && (
+          <div className="mt-10">
+            <div className="flex items-center gap-3 mb-6">
+              <div className="p-2 bg-indigo-500/10 rounded-lg border border-indigo-500/20">
+                <Cpu className="h-5 w-5 text-indigo-400" />
+              </div>
+              <div>
+                <h2 className="text-xl font-bold text-white">
+                  Agentic Remediation Pipeline
+                </h2>
+                <p className="text-slate-400 text-sm">
+                  Per-finding triage → context → patch → validate → score
+                </p>
+              </div>
+            </div>
+            <AgentPipelineReceipt
+              findings={agenticResults}
+              scanId={currentScan.id}
+              repoUrl={currentScan.repo_url}
+              scannedAt={currentScan.timestamp}
+            />
+          </div>
+        )}
+
         {!currentScan && !isScanning && (
           <div className="h-96 flex flex-col items-center justify-center text-slate-600 border-2 border-dashed border-slate-800 rounded-3xl mt-8">
             <div className="h-16 w-16 bg-slate-900 rounded-full flex items-center justify-center mb-4">
@@ -391,7 +426,7 @@ function NavItem({ icon, label, href }: { icon: React.ReactNode, label: string, 
         ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-500/20'
         : 'text-slate-400 hover:text-slate-200 hover:bg-slate-800'
     }`}>
-      {React.cloneElement(icon as React.ReactElement, { size: 18 })}
+      {React.cloneElement(icon as React.ReactElement<{ size?: number }>, { size: 18 })}
       {label}
     </div>
   );
