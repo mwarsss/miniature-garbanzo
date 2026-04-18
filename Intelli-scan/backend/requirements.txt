@@ -16,3 +16,5 @@ pytest
 pytest-asyncio
 pytest-cov
 httpx
+tree-sitter>=0.21.0
+tree-sitter-python>=0.21.0

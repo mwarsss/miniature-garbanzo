@@ -36,6 +36,7 @@ from error_handlers import (
 )
 from cache import get_cache, generate_cache_key
 from metrics import metrics, track_scan_metrics, track_ai_metrics
+from agents.remediation_agent import run_remediation_pipeline
 
 # --- Setup Logging ---
 setup_logging(settings.log_level, settings.enable_structured_logging)
@@ -118,8 +119,23 @@ class RemediationDetail(BaseModel):
     fix_code: str
     explanation: str
 
-class RemediationResult(BaseModel):
+class LegacyRemediationResult(BaseModel):
+    """Legacy one-shot remediation result — used by /trivy_remediation endpoint."""
     remediations: List[RemediationDetail]
+
+class RemediationResult(BaseModel):
+    """Per-finding result from the agentic remediation pipeline."""
+    finding_id: str
+    file_path: str
+    vuln_type: str
+    priority_score: int
+    skipped: bool
+    patched_code: Optional[str] = None
+    explanation: Optional[str] = None
+    ris_score: Optional[float] = None
+    verdict: str
+    new_findings_introduced: List = []
+    validation_passed: Optional[bool] = None
 
 class ScanRequest(BaseModel):
     repo_url: str
@@ -297,7 +313,7 @@ Format your response as a single JSON object with this exact structure:
 
 @retry_on_failure(max_attempts=settings.ai_max_retries)
 @handle_errors
-async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[RemediationResult]:
+async def _perform_ai_remediation(sca_result: dict, sast_result: dict) -> Optional[LegacyRemediationResult]:
     """Generate remediation plan with retry logic and multi-key rotation using older SDK."""
     if not ai_models:
         logger.warning("AI model not configured, skipping remediation")
@@ -348,7 +364,7 @@ Format your response as a single JSON object with this exact structure:
             response_text = response_text.strip()
 
             parsed_output = json.loads(response_text)
-            result = RemediationResult(**parsed_output)
+            result = LegacyRemediationResult(**parsed_output)
 
             # Track metrics
             duration_ms = (time.time() - start_time) * 1000
@@ -676,21 +692,28 @@ def list_scans(limit: int = 50):
         logger.error(f"Error listing scans: {e}")
         raise HTTPException(status_code=500, detail="Database error while fetching scans.")
 
-@app.get("/scan/{scan_id}/remediation", response_model=RemediationResult)
+@app.get("/scan/{scan_id}/remediation", response_model=List[RemediationResult])
 async def get_remediation_plan(scan_id: str):
-    if not model_name:
-        raise HTTPException(status_code=500, detail="AI model is not configured. GOOGLE_API_KEY may be missing.")
-        
-    cache_key = f"remediation_plan_{scan_id}"
-    cached_plan = cache.get(cache_key)
-    if cached_plan:
-        return RemediationResult(**cached_plan)
-        
+    """
+    Run the agentic 5-step remediation pipeline over every finding in the scan.
+
+    The repo is re-cloned into a temp directory for context extraction and
+    Semgrep re-validation, then cleaned up automatically.  Results are cached
+    for 24 hours to avoid redundant re-clones.
+    """
+    cache_key = f"agentic_remediation_{scan_id}"
+    cached = cache.get(cache_key)
+    if cached:
+        return cached
+
     try:
         scan_id_int = int(scan_id)
         def fetch_scan():
             with db_pool.get_cursor() as cur:
-                cur.execute("SELECT status, sca_result, sast_result FROM scans WHERE id = %s", (scan_id_int,))
+                cur.execute(
+                    "SELECT status, sast_result, repo_url FROM scans WHERE id = %s",
+                    (scan_id_int,),
+                )
                 return cur.fetchone()
         scan = await run_in_threadpool(fetch_scan)
     except ValueError:
@@ -701,15 +724,61 @@ async def get_remediation_plan(scan_id: str):
 
     if not scan:
         raise HTTPException(status_code=404, detail="Scan ID not found.")
-    if scan['status'] != 'completed':
+    if scan["status"] != "completed":
         raise HTTPException(status_code=400, detail="Scan not completed.")
 
-    remediation_plan = await _perform_ai_remediation(scan['sca_result'], scan['sast_result'])
-    if not remediation_plan:
-        raise HTTPException(status_code=500, detail="Failed to generate remediation plan.")
-        
-    cache.set(cache_key, remediation_plan.model_dump(), ttl=86400)
-    return remediation_plan
+    # Normalise raw Semgrep JSON into the findings format expected by the pipeline
+    sast_raw = scan["sast_result"] or {}
+    raw_findings = sast_raw.get("results", [])
+    findings = [
+        {
+            "id": f.get("check_id", f"finding-{i}"),
+            "severity": (f.get("extra", {}).get("severity") or "LOW").upper(),
+            "file_path": f.get("path", ""),
+            "line_start": f.get("start", {}).get("line", 1),
+            "line_end": f.get("end", {}).get("line", 1),
+            "vuln_type": f.get("check_id", "").split(".")[-1].lower().replace("-", "_"),
+            "message": f.get("extra", {}).get("message", ""),
+            "raw_code_snippet": f.get("extra", {}).get("lines", ""),
+        }
+        for i, f in enumerate(raw_findings)
+    ]
+
+    # Re-clone repo so Context Agent and Semgrep Validator have file access
+    repo_url: str = scan.get("repo_url", "")
+    gemini_model = ai_models[0] if ai_models else None
+
+    async def _run_pipeline():
+        """Clone repo, run pipeline, clean up — executed in a thread."""
+        def _blocking():
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                if repo_url:
+                    try:
+                        from git import Repo as _Repo
+                        _Repo.clone_from(repo_url, tmp_dir, depth=1)
+                        logger.info(f"Re-cloned {repo_url} for remediation scan_id={scan_id}")
+                    except Exception as clone_err:
+                        logger.warning(f"Re-clone failed ({clone_err}); context agent will use snippets only")
+                scan_output = {
+                    "tool": "semgrep",
+                    "findings": findings,
+                    "repo_local_path": tmp_dir,
+                }
+                return run_remediation_pipeline(
+                    scan_output,
+                    gemini_model=gemini_model,
+                    semgrep_path=settings.semgrep_path,
+                )
+        return await run_in_threadpool(_blocking)
+
+    try:
+        results = await _run_pipeline()
+    except Exception as e:
+        logger.error(f"Agentic remediation pipeline failed for scan {scan_id}: {e}")
+        raise HTTPException(status_code=500, detail="Remediation pipeline failed.")
+
+    cache.set(cache_key, results, ttl=86400)
+    return results
 
 @app.get("/scan/{scan_id}", response_model=ScanStatus)
 def get_scan_status(scan_id: uuid.UUID):
@@ -928,7 +997,7 @@ def download_report(report_id: int):
         headers={"Content-Disposition": f"attachment; filename={report['filename']}"}
     )
 
-async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationResult]:
+async def _perform_trivy_remediation(trivy_json: dict) -> Optional[LegacyRemediationResult]:
     """
     Performs AI-powered remediation analysis on a Trivy JSON report with multi-key rotation using older SDK.
     """
@@ -967,7 +1036,7 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
             cleaned_response = response.text.strip().replace("```json", "").replace("```", "")
             parsed_output = json.loads(cleaned_response)
             logger.info(f"Trivy remediation completed using model instance #{i+1}")
-            return RemediationResult(**parsed_output)
+            return LegacyRemediationResult(**parsed_output)
         except Exception as e:
             error_str = str(e).lower()
             if "429" in error_str or "resource_exhausted" in error_str:
@@ -979,7 +1048,7 @@ async def _perform_trivy_remediation(trivy_json: dict) -> Optional[RemediationRe
     
     return None
 
-@app.get("/trivy_remediation", response_model=Optional[RemediationResult])
+@app.get("/trivy_remediation", response_model=Optional[LegacyRemediationResult])
 async def get_trivy_remediation_plan():
     """
     Reads the Trivy report, generates a remediation plan via AI, and returns it.
