@@ -785,8 +785,9 @@ def run_remediation_pipeline(
                     "new_findings_introduced": [],
                     "validation_passed": None,
                     "diff_summary": None,
-                    "dual_scan": None,
+                    "dual_scan_result": None,
                     "ris_breakdown": None,
+                    "rigorous_ris": False,
                 }
             )
             continue
@@ -824,44 +825,68 @@ def run_remediation_pipeline(
                     "new_findings_introduced": validation.get("new_findings", []),
                     "validation_passed": False,
                     "diff_summary": None,
-                    "dual_scan": None,
+                    "dual_scan_result": None,
                     "ris_breakdown": None,
+                    "rigorous_ris": False,
                 }
             )
             continue
 
-        # ---- Step 5: Score (basic — may be replaced below) ----
+        # ---- Step 5: Score (basic — preserved as basic_ris for comparison) ----
         logger.debug("Pipeline: [%s] Step 5 — score_remediation", finding_id)
-        score = agent.score_remediation(patch, validation)
+        basic_score = agent.score_remediation(patch, validation)
+        # Start with basic score; Step 6 will replace ris_score/verdict if it runs
+        score = {
+            "ris_score": basic_score["ris_score"],
+            "verdict": basic_score["verdict"],
+        }
 
         # ---- Step 6: Rigorous RIS (replaces Step 5 score) ----
+        # Runs when patched_code exists regardless of whether validation_passed,
+        # so judges see the diff/dual-scan analysis even on borderline patches.
         diff_summary_dict: Optional[dict] = None
-        dual_scan_dict: Optional[dict] = None
+        dual_scan_result_dict: Optional[dict] = None
         ris_breakdown: Optional[dict] = None
+        rigorous_ris_ran = False
 
         if (
             _PATCH_VALIDATOR_AVAILABLE
             and _diff_engine is not None
             and _dual_validator is not None
+            and (validation["validation_passed"] or patch.get("patched_code") is not None)
             and patch.get("patched_code")
         ):
             try:
                 logger.debug("Pipeline: [%s] Step 6 — rigorous RIS", finding_id)
-                original_content = context.get("full_file_content", "") or ""
-                patched_content = patch["patched_code"]
+                patched_content: str = patch["patched_code"]
+
+                # Prefer reading original file from disk for accuracy;
+                # fall back to the context snapshot captured in Step 2.
+                original_content = ""
+                if repo_path and file_path:
+                    orig_path = Path(repo_path) / file_path
+                    if orig_path.exists():
+                        try:
+                            original_content = orig_path.read_text(
+                                encoding="utf-8", errors="replace"
+                            )
+                        except OSError:
+                            pass
+                if not original_content:
+                    original_content = context.get("full_file_content", "") or ""
 
                 diff_out = _diff_engine.compute_diff(
                     original_content, patched_content, file_path
                 )
                 diff_summary_dict = diff_out.get("diff_summary")
 
-                dual_scan_dict = _dual_validator.run_dual_scan(
+                dual_scan_result_dict = _dual_validator.run_dual_scan(
                     patched_content, triaged, repo_path
                 )
 
                 rigorous = _compute_rigorous_ris(
                     diff_summary=diff_summary_dict or {},
-                    dual_scan_result=dual_scan_dict,
+                    dual_scan_result=dual_scan_result_dict,
                     patch_confidence=patch.get("confidence", 0.0),
                     original_finding=triaged,
                 )
@@ -870,7 +895,8 @@ def run_remediation_pipeline(
                     "ris_score": rigorous["ris_score"],
                     "verdict": rigorous["verdict"],
                 }
-                ris_breakdown = rigorous.get("ris_breakdown")
+                ris_breakdown = rigorous.get("score_breakdown")
+                rigorous_ris_ran = True
 
             except Exception as exc:  # noqa: BLE001
                 logger.error(
@@ -890,11 +916,13 @@ def run_remediation_pipeline(
                 "explanation": patch.get("explanation"),
                 "ris_score": score["ris_score"],
                 "verdict": score["verdict"],
+                "basic_ris": basic_score["ris_score"],       # Step 5 score preserved
                 "new_findings_introduced": validation.get("new_findings", []),
                 "validation_passed": validation["validation_passed"],
                 "diff_summary": diff_summary_dict,
-                "dual_scan": dual_scan_dict,
+                "dual_scan_result": dual_scan_result_dict,
                 "ris_breakdown": ris_breakdown,
+                "rigorous_ris": rigorous_ris_ran,
             }
         )
 

@@ -136,6 +136,11 @@ class RemediationResult(BaseModel):
     verdict: str
     new_findings_introduced: List = []
     validation_passed: Optional[bool] = None
+    basic_ris: Optional[float] = None
+    diff_summary: Optional[dict] = None
+    dual_scan_result: Optional[dict] = None
+    ris_breakdown: Optional[dict] = None
+    rigorous_ris: bool = False
 
 class ScanRequest(BaseModel):
     repo_url: str

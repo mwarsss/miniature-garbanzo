@@ -22,33 +22,30 @@ ASSUMPTIONS
    (neither penalised nor rewarded — the formula normalises for this case).
 3. Semgrep is already on PATH from the existing pipeline. If missing, the
    dual Semgrep scan degrades gracefully — semgrep_tool_error=True.
-4. The RIS formula's positive weights sum to 1.0 so that a perfect patch
-   achieves RIS=1.0 before penalties. Penalties model risk introduced by the
-   patch itself (new vulns, new imports, excessive diff scope).
-5. The formula was finalised based on the spec fragment that was provided.
-   The prompt was truncated before the exact formula was stated, so this
-   implementation uses a weighted decomposition that is auditable and matches
-   the spirit of the description: "more rigorous than the basic one, runs
-   post-validation, replaces the final score".
+4. The canonical RIS formula (Part 3) was provided in the project spec:
+     base_score = 0.40*eliminated + 0.25*confidence
+                  + 0.20*tool_reliability + 0.15*bandit_clean
+     penalty    = 0.10*new_semgrep + 0.05*imports_added
+                  + 0.02*max(0, lines_changed-50)
+     ris = clamp(base_score - penalty, 0.0, 1.0)
+   This supersedes the placeholder formula used in the previous commit.
+5. score_breakdown exposes every per-signal contribution so the frontend
+   can render each as a visual bar without any additional computation.
 
-RIS FORMULA (documented here for judge review)
------------------------------------------------
-Positive signals (sum = 1.0):
-  0.35  original_vuln_eliminated  (Semgrep confirms vuln is gone)
-  0.20  patch_confidence          (Gemini self-assessed confidence)
-  0.15  bandit_clean              (no new Bandit issues, or Bandit skipped)
-  0.15  semgrep_clean             (no new Semgrep findings in patched file)
-  0.10  diff_minimal              (lines_changed_total <= 30; surgical = safer)
-  0.05  ast_parse_success         (patched code is valid & parseable)
-
-Penalties (subtracted after positives):
-  -0.05 per new Semgrep finding (capped at 3 findings → max -0.15)
-  -0.03 per new Bandit HIGH/CRITICAL issue (capped at 3 → max -0.09)
-  -0.02 per new import added (capped at 5 → max -0.10)
-  -0.05 if lines_changed_total > 100 (excessively large diff)
-  -0.05 if severity is CRITICAL and vuln NOT eliminated (failure is worse)
-
-Final RIS is clamped to [0.0, 1.0].
+RIS FORMULA (canonical — for judge review)
+------------------------------------------
+base_score = (
+    0.40 * original_vuln_eliminated        # primary objective
+    + 0.25 * patch_confidence              # Gemini self-assessment
+    + 0.20 * tool_reliability              # Semgrep ran without error
+    + 0.15 * bandit_clean                  # no new Bandit issues (or skipped)
+)
+penalty = (
+    0.10 * len(new_semgrep_findings)
+    + 0.05 * len(imports_added)
+    + 0.02 * max(0, lines_changed - 50)
+)
+ris = clamp(base_score - penalty, 0.0, 1.0)
 
 Verdicts:
   RIS >= 0.80 → AUTO_APPLY
@@ -650,11 +647,22 @@ def compute_ris(
     original_finding: dict,
 ) -> dict:
     """
-    Compute the Remediation Integrity Score (RIS) using a rigorous multi-signal
-    formula that incorporates semantic diff analysis and dual-tool validation.
+    Compute the Remediation Integrity Score (RIS).
 
-    This function is intended to *replace* the basic Step-5 score from
-    RemediationAgent.score_remediation() for findings that have a patched_code.
+    Uses the canonical formula specified for Intelli-Scan:
+
+    base_score = (
+        0.40 * vuln_eliminated
+        + 0.25 * patch_confidence
+        + 0.20 * tool_reliability          # Semgrep ran without error
+        + 0.15 * bandit_clean              # no new Bandit issues (or skipped)
+    )
+    penalty = (
+        0.10 * len(new_semgrep_findings)   # each new Semgrep finding
+        + 0.05 * len(imports_added)        # each new import introduced
+        + 0.02 * max(0, lines_changed - 50)  # excess lines beyond 50
+    )
+    ris = clamp(base_score - penalty, 0.0, 1.0)
 
     Parameters
     ----------
@@ -665,87 +673,61 @@ def compute_ris(
     patch_confidence : float
         The Gemini model's self-assessed confidence (0.0–1.0).
     original_finding : dict
-        The normalised finding dict (needs ``severity``).
+        Normalised finding dict — not used directly in this formula but
+        retained for future severity-based adjustments.
 
     Returns
     -------
     dict
         Keys:
-        - ``ris_score`` (float, clamped to [0.0, 1.0])
+        - ``ris_score`` (float, rounded to 4 d.p., clamped [0.0, 1.0])
         - ``verdict`` (str)
-        - ``ris_breakdown`` (dict — per-signal contributions for audit)
+        - ``base_score`` (float)
+        - ``penalty_applied`` (float)
+        - ``score_breakdown`` (dict) — per-signal contributions for
+          frontend rendering as a visual breakdown bar
     """
-    # ── Extract signals ───────────────────────────────────────────────────
-
-    eliminated = float(dual_scan_result.get("original_vuln_eliminated", False))
     confidence = max(0.0, min(1.0, float(patch_confidence)))
 
-    bandit_skipped: bool = dual_scan_result.get("bandit_skipped", False)
-    new_bandit_high: list = dual_scan_result.get("new_bandit_high_findings", [])
-    new_semgrep: list = dual_scan_result.get("new_semgrep_findings", [])
+    # ── Base score ────────────────────────────────────────────────────────
 
-    ast_ok = float(diff_summary.get("ast_parse_success", False))
-    imports_added: list = diff_summary.get("imports_added", [])
-    lines_changed: int = diff_summary.get("lines_changed_total", 0)
-
-    severity: str = original_finding.get("severity", "MEDIUM").upper()
-
-    # ── Positive contributions (weights sum to 1.0) ───────────────────────
-
-    #  0.35 — Semgrep confirmed original vuln eliminated
-    w_eliminated = 0.35 * eliminated
-
-    #  0.20 — AI model confidence in its own patch
-    w_confidence = 0.20 * confidence
-
-    #  0.15 — No new Bandit issues (or Bandit not applicable / skipped)
-    bandit_clean = float(
-        bandit_skipped or len(new_bandit_high) == 0
+    vuln_eliminated_contrib = 0.40 * float(
+        dual_scan_result.get("original_vuln_eliminated", False)
     )
-    w_bandit = 0.15 * bandit_clean
+    confidence_contrib = 0.25 * confidence
 
-    #  0.15 — No new Semgrep findings in patched file
-    semgrep_clean = float(len(new_semgrep) == 0)
-    w_semgrep_clean = 0.15 * semgrep_clean
+    # Tool reliability: Semgrep ran without an infrastructure error
+    tool_reliability_contrib = 0.20 * float(
+        not dual_scan_result.get("semgrep_tool_error", False)
+    )
 
-    #  0.10 — Diff is surgical (≤ 30 lines changed; larger diffs introduce more risk)
-    diff_minimal = float(lines_changed <= 30)
-    w_diff = 0.10 * diff_minimal
+    bandit_skipped: bool = dual_scan_result.get("bandit_skipped", False)
+    new_bandit: list = dual_scan_result.get("new_bandit_findings", [])
+    bandit_clean = bandit_skipped or len(new_bandit) == 0
+    clean_patch_contrib = 0.15 * float(bandit_clean)
 
-    #  0.05 — Code is AST-parseable (patched code is structurally valid)
-    w_ast = 0.05 * ast_ok
-
-    positive_total = (
-        w_eliminated + w_confidence + w_bandit + w_semgrep_clean + w_diff + w_ast
+    base_score = (
+        vuln_eliminated_contrib
+        + confidence_contrib
+        + tool_reliability_contrib
+        + clean_patch_contrib
     )
 
     # ── Penalties ─────────────────────────────────────────────────────────
 
-    #  -0.05 per new Semgrep finding, capped at 3 findings (max -0.15)
-    pen_semgrep = 0.05 * min(len(new_semgrep), 3)
+    new_semgrep: list = dual_scan_result.get("new_semgrep_findings", [])
+    imports_added: list = diff_summary.get("imports_added", [])
+    lines_changed: int = diff_summary.get("lines_changed_total", 0)
 
-    #  -0.03 per new Bandit HIGH/CRITICAL issue, capped at 3 (max -0.09)
-    pen_bandit = 0.03 * min(len(new_bandit_high), 3) if not bandit_skipped else 0.0
+    new_findings_penalty = 0.10 * len(new_semgrep)
+    imports_penalty = 0.05 * len(imports_added)
+    diff_size_penalty = 0.02 * max(0, lines_changed - 50)
 
-    #  -0.02 per new import added, capped at 5 (max -0.10)
-    pen_imports = 0.02 * min(len(imports_added), 5)
-
-    #  -0.05 if diff is excessively large (> 100 lines) — surgical patches are safer
-    pen_large_diff = 0.05 if lines_changed > 100 else 0.0
-
-    #  -0.05 extra penalty for CRITICAL findings where the vuln was NOT eliminated
-    pen_critical_miss = (
-        0.05 if severity == "CRITICAL" and eliminated == 0.0 else 0.0
-    )
-
-    penalty_total = (
-        pen_semgrep + pen_bandit + pen_imports + pen_large_diff + pen_critical_miss
-    )
+    penalty = new_findings_penalty + imports_penalty + diff_size_penalty
 
     # ── Final score ───────────────────────────────────────────────────────
 
-    raw_ris = positive_total - penalty_total
-    ris = round(max(0.0, min(1.0, raw_ris)), 4)
+    ris = round(max(0.0, min(1.0, base_score - penalty)), 4)
 
     if ris >= 0.80:
         verdict = "AUTO_APPLY"
@@ -754,33 +736,27 @@ def compute_ris(
     else:
         verdict = "MANUAL_REMEDIATION_REQUIRED"
 
-    breakdown = {
-        # Positive signals
-        "w_vuln_eliminated": round(w_eliminated, 4),
-        "w_ai_confidence": round(w_confidence, 4),
-        "w_bandit_clean": round(w_bandit, 4),
-        "w_semgrep_clean": round(w_semgrep_clean, 4),
-        "w_diff_minimal": round(w_diff, 4),
-        "w_ast_parseable": round(w_ast, 4),
-        "positive_total": round(positive_total, 4),
-        # Penalties
-        "pen_new_semgrep": round(pen_semgrep, 4),
-        "pen_new_bandit": round(pen_bandit, 4),
-        "pen_new_imports": round(pen_imports, 4),
-        "pen_large_diff": round(pen_large_diff, 4),
-        "pen_critical_miss": round(pen_critical_miss, 4),
-        "penalty_total": round(penalty_total, 4),
-        # Summary
-        "raw_ris": round(raw_ris, 4),
-        "ris_score": ris,
-        "verdict": verdict,
+    score_breakdown = {
+        "vuln_eliminated_contribution": round(vuln_eliminated_contrib, 4),
+        "confidence_contribution": round(confidence_contrib, 4),
+        "tool_reliability_contribution": round(tool_reliability_contrib, 4),
+        "clean_patch_contribution": round(clean_patch_contrib, 4),
+        "new_findings_penalty": round(new_findings_penalty, 4),
+        "imports_penalty": round(imports_penalty, 4),
+        "diff_size_penalty": round(diff_size_penalty, 4),
     }
 
     logger.debug(
-        "compute_ris: +%.3f −%.3f = RIS %.3f (%s)",
-        positive_total,
-        penalty_total,
+        "compute_ris: base=%.3f penalty=%.3f RIS=%.3f (%s)",
+        base_score,
+        penalty,
         ris,
         verdict,
     )
-    return {"ris_score": ris, "verdict": verdict, "ris_breakdown": breakdown}
+    return {
+        "ris_score": ris,
+        "verdict": verdict,
+        "base_score": round(base_score, 4),
+        "penalty_applied": round(penalty, 4),
+        "score_breakdown": score_breakdown,
+    }
