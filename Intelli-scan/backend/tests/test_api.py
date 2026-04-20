@@ -114,37 +114,54 @@ def test_remediation_scan_not_completed(client, mock_db_pool):
     assert "not completed" in response.json()["detail"].lower()
 
 
-@patch('main.model')
-@patch('main._perform_ai_remediation')
-def test_remediation_success(mock_remediation, mock_model, client, mock_db_pool):
-    """Test successful remediation generation."""
-    # Mock database
+@patch('main.run_remediation_pipeline')
+def test_remediation_success(mock_pipeline, client, mock_db_pool):
+    """Test successful agentic remediation pipeline returns per-finding list."""
     mock_cursor = Mock()
     mock_db_pool.get_cursor.return_value.__enter__.return_value = mock_cursor
     mock_cursor.fetchone.return_value = {
         'status': 'completed',
         'sca_result': {'Results': []},
-        'sast_result': {'results': []}
+        'sast_result': {'results': [
+            {
+                'check_id': 'python.lang.security.sqli',
+                'path': 'src/db.py',
+                'start': {'line': 10},
+                'end': {'line': 10},
+                'extra': {'message': 'SQL injection', 'severity': 'HIGH'},
+            }
+        ]},
+        'repo_url': 'https://github.com/test/repo',
     }
-    
-    # Mock AI remediation
-    from main import RemediationResult, RemediationDetail
-    mock_remediation.return_value = RemediationResult(
-        remediations=[
-            RemediationDetail(
-                issue="SQL Injection",
-                fix_code="Use parameterized queries",
-                explanation="Prevents SQL injection attacks"
-            )
-        ]
-    )
-    
+    mock_pipeline.return_value = [
+        {
+            'finding_id': 'python.lang.security.sqli::src/db.py:10',
+            'file_path': 'src/db.py',
+            'vuln_type': 'sql-injection',
+            'priority_score': 80,
+            'skipped': False,
+            'patched_code': 'cursor.execute(q, (val,))',
+            'explanation': 'Use parameterized query.',
+            'ris_score': 0.85,
+            'verdict': 'AUTO_APPLY',
+            'basic_ris': 0.72,
+            'new_findings_introduced': [],
+            'validation_passed': True,
+            'diff_summary': None,
+            'dual_scan_result': None,
+            'ris_breakdown': None,
+            'rigorous_ris': False,
+        }
+    ]
+
     response = client.get("/scan/1/remediation")
     assert response.status_code == 200
     data = response.json()
-    assert "remediations" in data
-    assert len(data["remediations"]) == 1
-    assert data["remediations"][0]["issue"] == "SQL Injection"
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]['finding_id'] == 'python.lang.security.sqli::src/db.py:10'
+    assert data[0]['verdict'] == 'AUTO_APPLY'
+    assert data[0]['ris_score'] == 0.85
 
 
 def test_remediation_invalid_scan_id(client, mock_db_pool):
