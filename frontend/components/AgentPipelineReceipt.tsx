@@ -54,6 +54,10 @@ import {
   Printer,
   Minus,
 } from 'lucide-react';
+import RISGauge from '@/components/ui/RISGauge';
+import PatchDiffScoringPanel, {
+  type PatchDiffScoringPanelProps,
+} from '@/components/PatchDiffScoringPanel';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -82,6 +86,12 @@ export interface RemediationFinding {
   confidence?: number;
   syntax_valid?: boolean;
   vuln_eliminated?: boolean;
+  // Agentic pipeline v2 — patch integrity fields
+  basic_ris?: number | null;
+  rigorous_ris?: boolean;
+  diff_summary?: PatchDiffScoringPanelProps['finding']['diff_summary'];
+  dual_scan_result?: PatchDiffScoringPanelProps['finding']['dual_scan_result'];
+  ris_breakdown?: PatchDiffScoringPanelProps['finding']['ris_breakdown'];
 }
 
 export interface AgentPipelineReceiptProps {
@@ -150,90 +160,6 @@ function getLanguage(filePath: string): string {
     sql: 'sql',
   };
   return map[ext] ?? 'python';
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// RIS Gauge — animated SVG arc
-// ─────────────────────────────────────────────────────────────────────────────
-
-const R = 38;
-const CIRCUMFERENCE = 2 * Math.PI * R;
-
-function RisGauge({
-  score,
-  size = 88,
-}: {
-  score: number;
-  size?: number;
-}) {
-  const [displayed, setDisplayed] = useState(0);
-
-  useEffect(() => {
-    // Commit the zero state first, then animate to the target value
-    const raf = requestAnimationFrame(() => {
-      setDisplayed(score);
-    });
-    return () => cancelAnimationFrame(raf);
-  }, [score]);
-
-  const offset = CIRCUMFERENCE * (1 - displayed);
-  const strokeColor =
-    score >= 0.8 ? '#10b981' : score >= 0.5 ? '#f59e0b' : '#f43f5e';
-
-  return (
-    <svg
-      viewBox="0 0 100 100"
-      width={size}
-      height={size}
-      aria-label={`RIS score ${Math.round(score * 100)}`}
-    >
-      {/* Track */}
-      <circle
-        cx="50"
-        cy="50"
-        r={R}
-        fill="none"
-        stroke="#1e293b"
-        strokeWidth="10"
-      />
-      {/* Arc */}
-      <circle
-        cx="50"
-        cy="50"
-        r={R}
-        fill="none"
-        stroke={strokeColor}
-        strokeWidth="10"
-        strokeLinecap="round"
-        strokeDasharray={CIRCUMFERENCE}
-        strokeDashoffset={offset}
-        transform="rotate(-90 50 50)"
-        style={{ transition: 'stroke-dashoffset 1.1s ease-out' }}
-      />
-      {/* Score text */}
-      <text
-        x="50"
-        y="46"
-        textAnchor="middle"
-        dominantBaseline="middle"
-        fontSize="22"
-        fontWeight="bold"
-        fill="white"
-      >
-        {Math.round(score * 100)}
-      </text>
-      <text
-        x="50"
-        y="65"
-        textAnchor="middle"
-        dominantBaseline="middle"
-        fontSize="11"
-        fill="#94a3b8"
-      >
-        RIS
-      </text>
-    </svg>
-  );
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -707,7 +633,7 @@ function FindingCard({ finding }: { finding: RemediationFinding }) {
                     isLast
                   >
                     <div className="flex items-center gap-6">
-                      <RisGauge score={risScore} size={88} />
+                      <RISGauge score={risScore} size={88} />
                       <div className="space-y-3">
                         <div>
                           <p className="text-xs text-slate-500 uppercase tracking-wide mb-1">
@@ -748,7 +674,7 @@ function FindingCard({ finding }: { finding: RemediationFinding }) {
 
                 {/* ── EXPLANATION BLOCKQUOTE ───────────────────────── */}
                 {finding.explanation && (
-                  <blockquote className="border-l-4 border-indigo-500/50 bg-indigo-500/5 rounded-r-xl pl-4 pr-4 py-3">
+                  <blockquote className="border-l-4 border-indigo-500/50 bg-indigo-500/5 rounded-r-xl pl-4 pr-4 py-3 mb-5">
                     <p className="text-xs text-slate-400 uppercase font-semibold tracking-wide mb-1.5">
                       Gemini Explanation
                     </p>
@@ -757,6 +683,27 @@ function FindingCard({ finding }: { finding: RemediationFinding }) {
                     </p>
                   </blockquote>
                 )}
+
+                {/* ── PATCH INTEGRITY ANALYSIS ─────────────────────── */}
+                <div className="border-t border-slate-800 pt-5">
+                  <p className="text-xs text-slate-500 uppercase font-semibold tracking-wider mb-4">
+                    Patch Integrity Analysis
+                  </p>
+                  <PatchDiffScoringPanel
+                    finding={{
+                      finding_id: finding.finding_id,
+                      vuln_type: finding.vuln_type,
+                      ris_score: finding.ris_score,
+                      verdict: (finding.verdict === 'SKIPPED'
+                        ? 'MANUAL_REMEDIATION_REQUIRED'
+                        : finding.verdict) as PatchDiffScoringPanelProps['finding']['verdict'],
+                      rigorous_ris: finding.rigorous_ris ?? false,
+                      diff_summary: finding.diff_summary ?? null,
+                      dual_scan_result: finding.dual_scan_result ?? null,
+                      ris_breakdown: finding.ris_breakdown ?? null,
+                    }}
+                  />
+                </div>
               </>
             )}
           </div>
