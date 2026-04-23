@@ -44,13 +44,14 @@ def test_start_scan_missing_repo_url(client, mock_db_pool):
 def test_start_scan_success(client, mock_db_pool):
     """Test successful scan initiation."""
     mock_cursor = Mock()
+    mock_cursor.fetchone.return_value = {"id": 1}
     mock_db_pool.get_cursor.return_value.__enter__.return_value = mock_cursor
-    
+
     response = client.post(
         "/scan",
         json={"repo_url": "https://github.com/test/repo"}
     )
-    
+
     assert response.status_code == 202
     data = response.json()
     assert "scan_id" in data

@@ -5,8 +5,10 @@ import os
 import shutil
 import time
 import asyncio
+import hmac
+import hashlib
 from starlette.concurrency import run_in_threadpool
-from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Request
 from fastapi.responses import Response, StreamingResponse, JSONResponse
 from pydantic import BaseModel, Field
 from git import Repo, GitCommandError
@@ -188,7 +190,111 @@ class Scan(BaseModel):
     submit_time: datetime.datetime
     finished_at: Optional[datetime.datetime] = None
 
-# --- Database Table Creation (on startup) ---
+# ─────────────────────────────────────────────────────────────────────────────
+# OWASP Top 10 (2021) mapping
+# ─────────────────────────────────────────────────────────────────────────────
+
+OWASP_TOP10_2021: dict[str, str] = {
+    "A01": "Broken Access Control",
+    "A02": "Cryptographic Failures",
+    "A03": "Injection",
+    "A04": "Insecure Design",
+    "A05": "Security Misconfiguration",
+    "A06": "Vulnerable and Outdated Components",
+    "A07": "Identification and Authentication Failures",
+    "A08": "Software and Data Integrity Failures",
+    "A09": "Security Logging and Monitoring Failures",
+    "A10": "Server-Side Request Forgery (SSRF)",
+}
+
+_VULN_TO_OWASP: dict[str, str] = {
+    "sql-injection": "A03",
+    "sqli": "A03",
+    "command-injection": "A03",
+    "code-injection": "A03",
+    "xss": "A03",
+    "xxe": "A03",
+    "ldap-injection": "A03",
+    "path-traversal": "A01",
+    "directory-traversal": "A01",
+    "broken-access-control": "A01",
+    "csrf": "A01",
+    "open-redirect": "A01",
+    "idor": "A01",
+    "hardcoded-secret": "A02",
+    "hardcoded-password": "A07",
+    "weak-crypto": "A02",
+    "insecure-tls": "A02",
+    "sensitive-data-exposure": "A02",
+    "ssrf": "A10",
+    "server-side-request-forgery": "A10",
+    "missing-auth": "A07",
+    "broken-authentication": "A07",
+    "insecure-deserialization": "A08",
+    "prototype-pollution": "A08",
+    "supply-chain": "A06",
+    "outdated-dependency": "A06",
+    "security-misconfiguration": "A05",
+    "debug-enabled": "A05",
+    "missing-security-header": "A05",
+}
+
+
+def _map_to_owasp(vuln_type: str, check_id: str = "") -> Optional[str]:
+    """Return OWASP Top 10 category code for a given vuln type or check_id."""
+    combined = f"{vuln_type} {check_id}".lower()
+    for keyword, code in _VULN_TO_OWASP.items():
+        if keyword in combined:
+            return code
+    return None
+
+
+def _extract_cvss_cve_summary(sca_result: dict) -> list[dict]:
+    """
+    Pull CVE IDs, CVSS v3 scores, severity, and fix version from Trivy SCA JSON.
+    Returns list sorted by CVSS score descending.
+    """
+    entries: list[dict] = []
+    for target in sca_result.get("Results", []):
+        for vuln in target.get("Vulnerabilities", []):
+            cve_id = vuln.get("VulnerabilityID", "")
+            if not cve_id:
+                continue
+            cvss_score: Optional[float] = None
+            for _source, scores in (vuln.get("CVSS") or {}).items():
+                v3 = scores.get("V3Score")
+                if v3 is not None:
+                    cvss_score = float(v3)
+                    break
+            entries.append({
+                "cve_id": cve_id,
+                "package": vuln.get("PkgName", ""),
+                "installed_version": vuln.get("InstalledVersion", ""),
+                "fixed_version": vuln.get("FixedVersion", "—"),
+                "severity": vuln.get("Severity", "UNKNOWN"),
+                "cvss_score": cvss_score,
+                "title": vuln.get("Title", ""),
+                "owasp": "A06 — Vulnerable and Outdated Components",
+            })
+    return sorted(entries, key=lambda x: (x.get("cvss_score") or 0), reverse=True)
+
+
+def _log_audit_event(entity_type: str, entity_id: int, action: str, changes: Optional[dict] = None) -> None:
+    """Write a row to audit_logs. Silently swallows errors to never block the main flow."""
+    try:
+        with db_pool.get_cursor() as cur:
+            cur.execute(
+                "INSERT INTO audit_logs (entity_type, entity_id, action, changes) VALUES (%s, %s, %s, %s)",
+                (entity_type, entity_id, action, json.dumps(changes) if changes else None),
+            )
+    except Exception as audit_err:
+        logger.warning(f"Audit log write failed (non-fatal): {audit_err}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Database Table Creation (on startup)
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.on_event("startup")
 def startup_event():
     """Initialize database tables and log startup info."""
@@ -245,20 +351,51 @@ async def _perform_ai_analysis(sca_result: dict, sast_result: dict) -> Optional[
     
     start_time = time.time()
     policy_context = await run_in_threadpool(get_policy_context)
+    # Build CVE/CVSS context for the prompt
+    cve_entries = _extract_cvss_cve_summary(sca_result)
+    cve_context = ""
+    if cve_entries:
+        cve_context = "\n### Top CVEs by CVSS Score ###\n"
+        for e in cve_entries[:10]:
+            score_str = f"CVSS {e['cvss_score']:.1f}" if e['cvss_score'] else "No CVSS"
+            cve_context += (
+                f"- [{e['cve_id']}] {e['package']} {e['installed_version']} "
+                f"({e['severity']}, {score_str}) → fix: {e['fixed_version']} — {e['title']}\n"
+            )
+
+    # Build OWASP context for SAST findings
+    sast_findings = sast_result.get("results", [])
+    owasp_hits: dict[str, list[str]] = {}
+    for f in sast_findings:
+        check_id = f.get("check_id", "")
+        vuln_type = check_id.split(".")[-1].lower()
+        category = _map_to_owasp(vuln_type, check_id)
+        if category:
+            label = f"{category} — {OWASP_TOP10_2021.get(category, '')}"
+            owasp_hits.setdefault(label, []).append(check_id)
+    owasp_context = ""
+    if owasp_hits:
+        owasp_context = "\n### OWASP Top 10 (2021) Coverage ###\n"
+        for label, rules in owasp_hits.items():
+            owasp_context += f"- {label}: {len(rules)} finding(s) [{', '.join(rules[:3])}]\n"
+
     prompt = f"""
 As an expert security analyst, analyze the following scan results.
 Your response MUST be contextualized by the internal security policies provided.
 Instead of generic advice, reference specific policy documents or sections where applicable.
+Map each vulnerability to its OWASP Top 10 (2021) category where possible.
 
 {policy_context}
 
 ### Security Scan Results ###
-SCA Results: {json.dumps(sca_result, indent=2)[:5000]}
-SAST Results: {json.dumps(sast_result, indent=2)[:5000]}
+SCA Results: {json.dumps(sca_result, indent=2)[:4000]}
+SAST Results: {json.dumps(sast_result, indent=2)[:4000]}
+{cve_context}
+{owasp_context}
 
-Generate a JSON response with an executive summary and the top 3 vulnerabilities,
-linking them to the policies. For example, if a policy requires MFA, and a finding
-relates to weak authentication, your POC should mention the specific policy.
+Generate a JSON response with an executive summary and the top 3 vulnerabilities.
+For each vulnerability include its OWASP category and any relevant CVE ID.
+Reference specific internal policy sections where applicable.
 
 Format your response as a single JSON object with this exact structure:
 {{
@@ -268,7 +405,7 @@ Format your response as a single JSON object with this exact structure:
             "name": "Vulnerability name",
             "severity": "HIGH",
             "file": "filename.js",
-            "poc": "Proof of concept"
+            "poc": "Proof of concept or CVE reference"
         }}
     ]
 }}
@@ -560,34 +697,68 @@ def generate_markdown_report(scan: dict) -> str:
         else:
             content += "No major vulnerabilities highlighted by the AI analyst.\n\n"
     
-    # SAST Results Section
+    # OWASP Coverage Section
     sast_results = scan.get('sast_result', {}).get('results', [])
+    owasp_hits: dict[str, list[str]] = {}
+    for f in sast_results:
+        check_id = f.get('check_id', '')
+        vuln_type = check_id.split('.')[-1].lower()
+        category = _map_to_owasp(vuln_type, check_id)
+        if category:
+            label = f"{category} — {OWASP_TOP10_2021.get(category, '')}"
+            owasp_hits.setdefault(label, []).append(check_id)
+    if owasp_hits:
+        content += "---\n\n## OWASP Top 10 (2021) Mapping\n\n"
+        content += "| OWASP Category | Findings |\n"
+        content += "|----------------|----------|\n"
+        for label, rules in sorted(owasp_hits.items()):
+            content += f"| {label} | {len(rules)} ({', '.join(rules[:2])}{'…' if len(rules) > 2 else ''}) |\n"
+        content += "\n"
+
+    # SAST Results Section
     content += "---\n\n## SAST (Static Analysis) Results\n\n"
     if sast_results:
         content += f"Found **{len(sast_results)}** potential issues.\n\n"
-        content += "| Severity | Rule ID | File:Line | Message |\n"
-        content += "|----------|---------|-----------|---------|\n"
+        content += "| Severity | OWASP | Rule ID | File:Line | Message |\n"
+        content += "|----------|-------|---------|-----------|----------|\n"
         for finding in sast_results:
             extra = finding.get('extra', {})
             severity = extra.get('severity', 'INFO')
-            message = extra.get('message', '').replace('\n', ' ')
+            message = extra.get('message', '').replace('\n', ' ')[:120]
             path = finding.get('path', 'N/A')
             line = finding.get('start', {}).get('line', 'N/A')
             check_id = finding.get('check_id', 'N/A')
-            content += f"| {severity} | {check_id} | `{path}:{line}` | {message} |\n"
+            vuln_type = check_id.split('.')[-1].lower()
+            owasp_code = _map_to_owasp(vuln_type, check_id) or '—'
+            content += f"| {severity} | {owasp_code} | {check_id} | `{path}:{line}` | {message} |\n"
         content += "\n"
     else:
         content += "No SAST findings.\n\n"
 
-    # SCA Results Section
-    sca_results = scan.get('sca_result', {}).get('Results', [])
+    # SCA Results Section — with CVE IDs and CVSS scores
+    sca_result_raw = scan.get('sca_result', {}) or {}
+    sca_results = sca_result_raw.get('Results', [])
+    cve_entries = _extract_cvss_cve_summary(sca_result_raw)
     content += "---\n\n## SCA (Dependency) Results\n\n"
+    if cve_entries:
+        content += f"Found **{len(cve_entries)}** CVEs across dependencies.\n\n"
+        content += "| CVSS | CVE ID | Package | Severity | OWASP | Fix Version | Title |\n"
+        content += "|------|--------|---------|----------|-------|-------------|-------|\n"
+        for e in cve_entries:
+            score = f"{e['cvss_score']:.1f}" if e['cvss_score'] else "N/A"
+            content += (
+                f"| {score} | {e['cve_id']} | {e['package']} {e['installed_version']} "
+                f"| {e['severity']} | A06 | {e['fixed_version']} | {e['title'][:60]} |\n"
+            )
+        content += "\n"
+
     if sca_results:
         total_vulns = 0
         for res in sca_results:
             total_vulns += len(res.get('Vulnerabilities', []))
-        content += f"Found **{total_vulns}** potential vulnerabilities in dependencies.\n\n"
-        
+        if not cve_entries:
+            content += f"Found **{total_vulns}** potential vulnerabilities in dependencies.\n\n"
+
         for res in sca_results:
             target = res.get('Target')
             vulns = res.get('Vulnerabilities', [])
@@ -647,6 +818,7 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
                         UPDATE scans
                         SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s, finished_at = %s
                         WHERE uuid = %s
+                        RETURNING id
                         """,
                         (
                             "completed",
@@ -657,7 +829,17 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
                             scan_uuid
                         )
                     )
-            await run_in_threadpool(save_results)
+                    row = cur.fetchone()
+                    return row["id"] if row else None
+            scan_db_id = await run_in_threadpool(save_results)
+            if scan_db_id:
+                sast_count = len((sast_result or {}).get("results", []))
+                sca_count = len(((sca_result or {}).get("Results") or [{}])[0].get("Vulnerabilities") or [])
+                _log_audit_event("scan", scan_db_id, "scan_completed", {
+                    "uuid": scan_uuid,
+                    "sast_findings": sast_count,
+                    "sca_findings": sca_count,
+                })
         except Exception as e:
             logger.error(f"[{scan_uuid}] Core scan logic failed: {e}")
             await update_status("failed", f"Scan error: {str(e)}")
@@ -671,9 +853,14 @@ def start_scan(request: ScanRequest, background_tasks: BackgroundTasks):
     scan_uuid = uuid.uuid4()
     with db_pool.get_cursor() as cur:
         cur.execute(
-            "INSERT INTO scans (uuid, repo_url, status) VALUES (%s, %s, %s)",
+            "INSERT INTO scans (uuid, repo_url, status) VALUES (%s, %s, %s) RETURNING id",
             (str(scan_uuid), request.repo_url, "queued")
         )
+        row = cur.fetchone()
+        scan_db_id = row["id"] if row else None
+
+    if scan_db_id:
+        _log_audit_event("scan", scan_db_id, "scan_queued", {"repo_url": request.repo_url, "uuid": str(scan_uuid)})
 
     background_tasks.add_task(_perform_scan, str(scan_uuid), request.repo_url)
     return {"scan_id": str(scan_uuid), "status": "queued"}
@@ -835,19 +1022,96 @@ async def upload_policy_document(file: UploadFile = File(...)):
 
         def save_policy():
             with db_pool.get_cursor() as cur:
-                # Simple approach: replace the document if it already exists to avoid duplicates
                 cur.execute("DELETE FROM policy_documents WHERE filename = %s", (filename,))
                 cur.execute(
-                    "INSERT INTO policy_documents (filename, content) VALUES (%s, %s)",
+                    "INSERT INTO policy_documents (filename, content) VALUES (%s, %s) RETURNING id",
                     (filename, content)
                 )
-        await run_in_threadpool(save_policy)
+                row = cur.fetchone()
+                return row["id"] if row else None
+        policy_id = await run_in_threadpool(save_policy)
+        if policy_id:
+            _log_audit_event("policy_document", policy_id, "policy_uploaded", {"filename": filename, "chars": len(content)})
 
         return {"status": "success", "filename": filename, "chars_read": len(content)}
     
     except Exception as e:
         logger.error(f"Failed to upload or process policy document '{filename}': {e}")
         raise HTTPException(status_code=500, detail=f"An error occurred: {e}")
+
+
+@app.get("/policies")
+async def list_policies():
+    """Return all uploaded policy documents (metadata only, no content)."""
+    try:
+        def fetch():
+            with db_pool.get_cursor() as cur:
+                cur.execute(
+                    "SELECT id, filename, uploaded_at FROM policy_documents ORDER BY uploaded_at DESC"
+                )
+                return cur.fetchall()
+        rows = await run_in_threadpool(fetch)
+        return [
+            {
+                "id": r["id"],
+                "filename": r["filename"],
+                "uploaded_at": r["uploaded_at"].isoformat() if r["uploaded_at"] else None,
+            }
+            for r in (rows or [])
+        ]
+    except Exception as e:
+        logger.error(f"Error listing policies: {e}")
+        raise HTTPException(status_code=500, detail="Database error while fetching policies.")
+
+
+@app.post("/github/webhook", status_code=202)
+async def github_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receives GitHub push webhook events and auto-triggers a scan.
+    Validates the HMAC-SHA256 signature when GITHUB_WEBHOOK_SECRET is set.
+    """
+    secret = os.environ.get("GITHUB_WEBHOOK_SECRET", "")
+    body = await request.body()
+
+    if secret:
+        sig_header = request.headers.get("X-Hub-Signature-256", "")
+        expected = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(expected, sig_header):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+
+    event = request.headers.get("X-GitHub-Event", "")
+    if event != "push":
+        return {"status": "ignored", "event": event}
+
+    try:
+        payload = json.loads(body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+
+    repo_url = payload.get("repository", {}).get("clone_url", "")
+    if not repo_url:
+        raise HTTPException(status_code=400, detail="No repository clone_url in payload.")
+
+    scan_uuid = uuid.uuid4()
+    with db_pool.get_cursor() as cur:
+        cur.execute(
+            "INSERT INTO scans (uuid, repo_url, status) VALUES (%s, %s, %s) RETURNING id",
+            (str(scan_uuid), repo_url, "queued")
+        )
+        row = cur.fetchone()
+        scan_db_id = row["id"] if row else None
+
+    pusher = payload.get("pusher", {}).get("name", "unknown")
+    ref = payload.get("ref", "")
+    if scan_db_id:
+        _log_audit_event("scan", scan_db_id, "webhook_triggered", {
+            "repo_url": repo_url, "ref": ref, "pusher": pusher, "uuid": str(scan_uuid)
+        })
+
+    background_tasks.add_task(_perform_scan, str(scan_uuid), repo_url)
+    logger.info(f"GitHub webhook triggered scan {scan_uuid} for {repo_url} (ref={ref}, pusher={pusher})")
+    return {"status": "queued", "scan_id": str(scan_uuid)}
+
 
 # --- Report Endpoints ---
 @app.post("/reports/generate", response_model=ReportResponse)
@@ -878,9 +1142,17 @@ def generate_report(request: ReportRequest):
                 """
                 INSERT INTO reports (scan_id, format, filename, content)
                 VALUES (%s, %s, %s, %s)
+                RETURNING id
                 """,
                 (request.scan_id, request.format, filename, report_content)
             )
+            row = cur.fetchone()
+            report_id = row["id"] if row else None
+
+        if report_id:
+            _log_audit_event("report", report_id, "report_generated", {
+                "scan_id": request.scan_id, "format": request.format, "filename": filename
+            })
 
         return ReportResponse(report_content=report_content, filename=filename)
 
