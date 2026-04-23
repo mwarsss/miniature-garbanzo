@@ -32,14 +32,17 @@ interface PastReport {
   generated_at: string;
 }
 
-interface RemediationDetail {
-  issue: string;
-  fix_code: string;
-  explanation: string;
-}
-
-interface RemediationResult {
-  remediations: RemediationDetail[];
+interface RemediationFinding {
+  finding_id: string;
+  file_path: string;
+  vuln_type: string;
+  priority_score: number;
+  skipped: boolean;
+  patched_code: string | null;
+  explanation: string | null;
+  ris_score: number | null;
+  verdict: string;
+  validation_passed: boolean | null;
 }
 
 export default function ReportsPage() {
@@ -50,7 +53,7 @@ export default function ReportsPage() {
   const [generating, setGenerating] = useState(false);
   const [remediating, setRemediating] = useState(false);
   const [report, setReport] = useState<{ content: string, filename: string } | null>(null);
-  const [remediationPlan, setRemediationPlan] = useState<RemediationResult | null>(null);
+  const [remediationPlan, setRemediationPlan] = useState<RemediationFinding[] | null>(null);
   const [error, setError] = useState<string | null>(null); // State for error messages
 
   // --- Data Fetching ---
@@ -267,8 +270,8 @@ export default function ReportsPage() {
               </button>
               <button
                 onClick={handleRemediation}
-                disabled={remediating}
-                className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${remediating
+                disabled={!selectedScan || remediating}
+                className={`w-full py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${!selectedScan || remediating
                   ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
                   : 'bg-indigo-600 hover:bg-indigo-500 text-white shadow-lg shadow-indigo-500/20'
                   }`}
@@ -300,19 +303,60 @@ export default function ReportsPage() {
 
             {remediationPlan && (
               <div className="mt-8 animate-in fade-in slide-in-from-bottom-4">
-                <h3 className="text-xl font-bold text-white mb-4">Top 3 AI Remediation Steps</h3>
-                <div className="space-y-6">
-                  {remediationPlan.remediations.map((item, index) => (
-                    <div key={index} className="bg-slate-900 border border-slate-800 rounded-xl p-6">
-                      <h4 className="font-bold text-lg text-indigo-400 mb-2">{index + 1}. {item.issue}</h4>
-                      <p className="text-sm text-slate-300 mb-4">{item.explanation}</p>
-                      <p className="text-xs text-slate-400 uppercase font-semibold mb-2">Suggested Fix:</p>
-                      <code className="block w-full bg-slate-950 p-4 rounded-lg text-sm text-slate-200 border border-slate-700 whitespace-pre-wrap font-mono">
-                        {item.fix_code}
-                      </code>
-                    </div>
-                  ))}
-                </div>
+                <h3 className="text-xl font-bold text-white mb-1">AI Remediation Plan</h3>
+                <p className="text-sm text-slate-400 mb-4">{remediationPlan.length} finding{remediationPlan.length !== 1 ? 's' : ''} analysed</p>
+                {remediationPlan.length === 0 ? (
+                  <div className="p-6 bg-slate-900 border border-slate-800 rounded-xl text-slate-400 text-sm text-center">
+                    No SAST findings found in this scan — nothing to remediate.
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {remediationPlan.map((item, index) => {
+                      const verdictColor = item.verdict === 'AUTO_APPLY'
+                        ? 'text-emerald-400 bg-emerald-900/20 border-emerald-800'
+                        : item.verdict === 'REVIEW_RECOMMENDED'
+                        ? 'text-amber-400 bg-amber-900/20 border-amber-800'
+                        : 'text-rose-400 bg-rose-900/20 border-rose-800';
+                      return (
+                        <div key={item.finding_id} className="bg-slate-900 border border-slate-800 rounded-xl p-6">
+                          <div className="flex items-start justify-between gap-4 mb-3">
+                            <div>
+                              <p className="text-xs text-slate-500 font-mono mb-1">{item.file_path}</p>
+                              <h4 className="font-bold text-base text-white">{index + 1}. {item.vuln_type.replace(/_/g, ' ').toUpperCase()}</h4>
+                            </div>
+                            <div className="flex items-center gap-2 flex-shrink-0">
+                              {item.ris_score != null && (
+                                <span className="text-xs text-slate-400 bg-slate-800 px-2 py-1 rounded">
+                                  RIS {(item.ris_score * 100).toFixed(0)}%
+                                </span>
+                              )}
+                              <span className={`text-xs font-semibold px-2 py-1 rounded border ${verdictColor}`}>
+                                {item.verdict?.replace(/_/g, ' ')}
+                              </span>
+                            </div>
+                          </div>
+                          {item.skipped ? (
+                            <p className="text-sm text-slate-500 italic">Skipped — low priority or insufficient context.</p>
+                          ) : (
+                            <>
+                              {item.explanation && (
+                                <p className="text-sm text-slate-300 mb-3">{item.explanation}</p>
+                              )}
+                              {item.patched_code && (
+                                <>
+                                  <p className="text-xs text-slate-400 uppercase font-semibold mb-2">Suggested Fix:</p>
+                                  <code className="block w-full bg-slate-950 p-4 rounded-lg text-sm text-slate-200 border border-slate-700 whitespace-pre-wrap font-mono">
+                                    {item.patched_code}
+                                  </code>
+                                </>
+                              )}
+                            </>
+                          )}
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
               </div>
             )}
 
