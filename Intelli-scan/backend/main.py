@@ -1041,8 +1041,52 @@ async def upload_policy_document(file: UploadFile = File(...)):
 
 
 @app.get("/policies")
-async def list_policies():
-    """Return all uploaded policy documents (metadata only, no content)."""
+async def list_scan_policies():
+    """Return enforcement rules / scan policies."""
+    try:
+        def fetch():
+            with db_pool.get_cursor() as cur:
+                cur.execute(
+                    "SELECT id, name, description, enabled, severity_threshold, block_on_failure FROM scan_policies ORDER BY id"
+                )
+                return cur.fetchall()
+        rows = await run_in_threadpool(fetch)
+        return [dict(r) for r in (rows or [])]
+    except Exception as e:
+        logger.error(f"Error listing scan policies: {e}")
+        raise HTTPException(status_code=500, detail="Database error while fetching policies.")
+
+
+@app.patch("/policies/{policy_id}")
+async def update_scan_policy(policy_id: int, body: dict):
+    """Toggle or update a scan policy rule."""
+    allowed = {"enabled", "severity_threshold", "block_on_failure"}
+    update = {k: v for k, v in body.items() if k in allowed}
+    if not update:
+        raise HTTPException(status_code=400, detail="No valid fields to update.")
+    set_clause = ", ".join(f"{k} = %s" for k in update)
+    try:
+        def do_update():
+            with db_pool.get_cursor() as cur:
+                cur.execute(
+                    f"UPDATE scan_policies SET {set_clause} WHERE id = %s RETURNING id",
+                    (*update.values(), policy_id)
+                )
+                return cur.fetchone()
+        row = await run_in_threadpool(do_update)
+        if not row:
+            raise HTTPException(status_code=404, detail="Policy not found.")
+        return {"status": "updated", "id": policy_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error updating policy {policy_id}: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
+
+
+@app.get("/policies/documents")
+async def list_policy_documents():
+    """Return uploaded policy document metadata (no content)."""
     try:
         def fetch():
             with db_pool.get_cursor() as cur:
@@ -1060,8 +1104,26 @@ async def list_policies():
             for r in (rows or [])
         ]
     except Exception as e:
-        logger.error(f"Error listing policies: {e}")
-        raise HTTPException(status_code=500, detail="Database error while fetching policies.")
+        logger.error(f"Error listing policy documents: {e}")
+        raise HTTPException(status_code=500, detail="Database error while fetching policy documents.")
+
+
+@app.delete("/policies/documents/{doc_id}", status_code=204)
+async def delete_policy_document(doc_id: int):
+    """Delete an uploaded policy document."""
+    try:
+        def do_delete():
+            with db_pool.get_cursor() as cur:
+                cur.execute("DELETE FROM policy_documents WHERE id = %s RETURNING id", (doc_id,))
+                return cur.fetchone()
+        row = await run_in_threadpool(do_delete)
+        if not row:
+            raise HTTPException(status_code=404, detail="Document not found.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting policy document {doc_id}: {e}")
+        raise HTTPException(status_code=500, detail="Database error.")
 
 
 @app.post("/github/webhook", status_code=202)

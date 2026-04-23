@@ -117,6 +117,30 @@ def create_tables(database_url: str):
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             );
         """)
+
+        # Enforcement rules / scan policies table
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS scan_policies (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(255) NOT NULL,
+                description TEXT NOT NULL,
+                enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                severity_threshold VARCHAR(50) NOT NULL DEFAULT 'HIGH',
+                block_on_failure BOOLEAN NOT NULL DEFAULT TRUE,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            );
+        """)
+        # Seed default rules if table is empty
+        cur.execute("SELECT COUNT(*) AS cnt FROM scan_policies")
+        if cur.fetchone()["cnt"] == 0:
+            cur.execute("""
+                INSERT INTO scan_policies (name, description, enabled, severity_threshold, block_on_failure) VALUES
+                ('No Critical Vulnerabilities', 'Fails scan if any Critical severity issues are found.', TRUE, 'CRITICAL', TRUE),
+                ('No High Severity Secrets', 'Blocks deployment if hardcoded secrets or API keys are detected.', TRUE, 'HIGH', TRUE),
+                ('OWASP Top 10 Compliance', 'Flags any finding mapped to the OWASP Top 10 (2021) categories.', TRUE, 'MEDIUM', FALSE),
+                ('Dependency Age Check', 'Warns when vulnerable components with known CVEs are used.', TRUE, 'HIGH', FALSE)
+                ON CONFLICT DO NOTHING;
+            """)
         
         # Reports table with foreign key
         cur.execute("""
