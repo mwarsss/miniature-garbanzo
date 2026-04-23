@@ -131,8 +131,8 @@ def create_tables(database_url: str):
             );
         """)
         # Seed default rules if table is empty
-        cur.execute("SELECT COUNT(*) AS cnt FROM scan_policies")
-        if cur.fetchone()["cnt"] == 0:
+        cur.execute("SELECT COUNT(*) FROM scan_policies")
+        if cur.fetchone()[0] == 0:
             cur.execute("""
                 INSERT INTO scan_policies (name, description, enabled, severity_threshold, block_on_failure) VALUES
                 ('No Critical Vulnerabilities', 'Fails scan if any Critical severity issues are found.', TRUE, 'CRITICAL', TRUE),
