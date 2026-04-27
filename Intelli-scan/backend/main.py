@@ -39,6 +39,17 @@ from error_handlers import (
 from cache import get_cache, generate_cache_key
 from metrics import metrics, track_scan_metrics, track_ai_metrics
 from agents.remediation_agent import run_remediation_pipeline
+from github_app import (
+    load_github_app_config,
+    get_installation_access_token,
+    github_app_configured,
+    WebhookEvent,
+    verify_webhook_signature,
+    parse_webhook_payload,
+    DiffScopedScanner,
+    PRManager,
+)
+from database import GitHubScanEvent, log_github_scan_event
 
 # --- Setup Logging ---
 setup_logging(settings.log_level, settings.enable_structured_logging)
@@ -1403,8 +1414,298 @@ async def get_trivy_remediation_plan():
         raise HTTPException(status_code=500, detail="Failed to parse report_trivy.json.")
 
     remediation_plan = await _perform_trivy_remediation(trivy_data)
-    
+
     if not remediation_plan:
         raise HTTPException(status_code=500, detail="Failed to generate AI remediation plan for Trivy report.")
-        
+
     return remediation_plan
+
+
+# =============================================================================
+# Part 5 — GitHub App Webhook Routes
+# =============================================================================
+
+async def _run_github_pipeline(event: WebhookEvent) -> None:
+    """
+    Full agentic pipeline triggered by a GitHub pull_request webhook event.
+
+    Steps
+    -----
+    1. Obtain a fresh installation access token for the triggering installation.
+    2. Fetch the list of changed (scannable) files from the PR diff.
+    3. Clone the PR head branch into a temp directory.
+    4. Run a scoped Semgrep scan over only the changed files.
+    5. Run the 5-step agentic remediation pipeline over every finding.
+    6. Create a patch branch from the PR head SHA.
+    7. Commit AUTO_APPLY patches to the patch branch.
+    8. If any patches were committed, open a child PR targeting the PR's base.
+    9. Post inline review comments on the parent PR for every finding.
+    10. Write a GitHubScanEvent row to the database for the activity feed.
+
+    All steps are wrapped in try/except — a failure at any step logs the error,
+    updates pipeline_status to "error", and always writes the scan event record.
+    The endpoint that spawned this task has already returned HTTP 200 to GitHub.
+    """
+    triggered_at = datetime.datetime.now(datetime.timezone.utc)
+    findings_count = 0
+    patches_committed_count = 0
+    child_pr_number: Optional[int] = None
+    child_pr_url: Optional[str] = None
+    pipeline_status = "success"
+    error_message: Optional[str] = None
+    cloned_path: Optional[str] = None
+
+    try:
+        config = load_github_app_config()
+        token = get_installation_access_token(event.installation_id, config)
+
+        scanner = DiffScopedScanner()
+        changed_files = await scanner.get_pr_diff_files(
+            event.repo_full_name, event.pr_number, token
+        )
+
+        if not changed_files:
+            logger.info(
+                "[%s #%d] No scannable files in PR diff — skipping",
+                event.repo_full_name, event.pr_number,
+            )
+            pipeline_status = "no_findings"
+            return
+
+        cloned_path = await run_in_threadpool(
+            scanner.clone_pr_head,
+            event.repo_clone_url,
+            event.pr_head_ref,
+            token,
+        )
+
+        def _blocking_scan_and_remediate():
+            scan_output = scanner.run_scoped_scan(cloned_path, changed_files)
+            gemini_model = ai_models[0] if ai_models else None
+            return run_remediation_pipeline(
+                scan_output,
+                gemini_model=gemini_model,
+                semgrep_path=settings.semgrep_path,
+            )
+
+        remediation_results = await run_in_threadpool(_blocking_scan_and_remediate)
+        findings_count = len(remediation_results) if remediation_results else 0
+
+        if not findings_count:
+            pipeline_status = "no_findings"
+            logger.info(
+                "[%s #%d] Pipeline produced no findings",
+                event.repo_full_name, event.pr_number,
+            )
+            return
+
+        manager = PRManager()
+
+        patch_branch = await run_in_threadpool(
+            manager.create_patch_branch,
+            event.repo_full_name,
+            event.pr_head_sha,
+            token,
+        )
+
+        committed = await run_in_threadpool(
+            manager.commit_patches,
+            event.repo_full_name,
+            patch_branch,
+            remediation_results,
+            cloned_path,
+            token,
+        )
+        patches_committed_count = len(committed)
+
+        if committed:
+            child_pr_data = await run_in_threadpool(
+                manager.open_child_pr,
+                event.repo_full_name,
+                patch_branch,
+                event.pr_base_ref,
+                event.pr_number,
+                committed,
+                token,
+            )
+            child_pr_number = child_pr_data.get("pr_number")
+            child_pr_url = child_pr_data.get("pr_url")
+        else:
+            logger.info(
+                "[%s #%d] No AUTO_APPLY patches — child PR not created",
+                event.repo_full_name, event.pr_number,
+            )
+
+        await run_in_threadpool(
+            manager.post_inline_review_comments,
+            event.repo_full_name,
+            event.pr_number,
+            child_pr_number,
+            remediation_results,
+            token,
+        )
+
+        pipeline_status = "success" if patches_committed_count > 0 else "partial"
+
+    except Exception as exc:
+        pipeline_status = "error"
+        error_message = str(exc)[:500]
+        logger.error(
+            "[%s #%d] GitHub pipeline failed: %s",
+            event.repo_full_name, event.pr_number, exc,
+        )
+
+    finally:
+        # Always clean up the cloned repo — no disk leaks
+        if cloned_path:
+            shutil.rmtree(cloned_path, ignore_errors=True)
+
+        # Always write the scan event record — never let DB write crash the task
+        scan_event = GitHubScanEvent(
+            repo_full_name=event.repo_full_name,
+            pr_number=event.pr_number,
+            pr_head_sha=event.pr_head_sha,
+            installation_id=event.installation_id,
+            triggered_at=triggered_at,
+            findings_count=findings_count,
+            patches_committed=patches_committed_count,
+            child_pr_number=child_pr_number,
+            child_pr_url=child_pr_url,
+            pipeline_status=pipeline_status,
+            error_message=error_message,
+        )
+        await run_in_threadpool(
+            log_github_scan_event, settings.database_url, scan_event
+        )
+        logger.info(
+            "[%s #%d] Pipeline complete: status=%s findings=%d patches=%d",
+            event.repo_full_name, event.pr_number,
+            pipeline_status, findings_count, patches_committed_count,
+        )
+
+
+@app.post("/webhooks/github", status_code=200)
+async def github_app_webhook(request: Request, background_tasks: BackgroundTasks):
+    """
+    Receive GitHub App pull_request webhook events.
+
+    The endpoint ALWAYS returns HTTP 200 within the 10-second GitHub timeout.
+    All heavy work runs in a background task via BackgroundTasks.
+
+    Authentication
+    --------------
+    Validates the HMAC-SHA256 signature in X-Hub-Signature-256 against
+    GITHUB_APP_WEBHOOK_SECRET. Returns HTTP 401 on mismatch.
+
+    Event filtering
+    ---------------
+    Only processes X-GitHub-Event: pull_request events with actions
+    opened / synchronize / reopened. All others return 200 immediately.
+    """
+    raw_body = await request.body()
+    signature = request.headers.get("X-Hub-Signature-256", "")
+    github_event = request.headers.get("X-GitHub-Event", "")
+
+    # Load secret for this verification only — not cached at module level
+    # so hot-reloading the env var takes effect without restart.
+    webhook_secret = os.environ.get("GITHUB_APP_WEBHOOK_SECRET", "")
+
+    if not verify_webhook_signature(raw_body, signature, webhook_secret):
+        logger.warning(
+            "Webhook signature verification failed (event=%s)", github_event
+        )
+        raise HTTPException(status_code=401, detail="Invalid webhook signature.")
+
+    if github_event != "pull_request":
+        logger.debug("Ignoring non-pull_request event: %s", github_event)
+        return {"status": "ignored", "event": github_event}
+
+    try:
+        payload = json.loads(raw_body)
+    except (json.JSONDecodeError, ValueError):
+        raise HTTPException(status_code=400, detail="Invalid JSON payload.")
+
+    event = parse_webhook_payload(payload)
+    if event is None:
+        # Unsupported action (e.g. "closed", "labeled") — acknowledge and stop
+        return {"status": "ignored", "action": payload.get("action", "unknown")}
+
+    logger.info(
+        "GitHub App webhook: %s PR #%d action=%s sha=%s",
+        event.repo_full_name, event.pr_number, event.action, event.pr_head_sha[:7],
+    )
+
+    background_tasks.add_task(_run_github_pipeline, event)
+    return {
+        "status": "accepted",
+        "repo": event.repo_full_name,
+        "pr_number": event.pr_number,
+    }
+
+
+@app.get("/webhooks/github/status")
+def github_webhook_status():
+    """
+    Health check confirming the GitHub App webhook handler is live.
+
+    ``github_app_configured`` is True only when all 5 required env vars
+    (GITHUB_APP_ID, GITHUB_APP_PRIVATE_KEY, GITHUB_APP_WEBHOOK_SECRET,
+    GITHUB_APP_CLIENT_ID, GITHUB_APP_CLIENT_SECRET) are present and non-empty.
+    """
+    return {
+        "status": "active",
+        "github_app_configured": github_app_configured(),
+        "supported_events": ["pull_request"],
+    }
+
+
+# =============================================================================
+# Part 6 — GitHub Scan History Route
+# =============================================================================
+
+@app.get("/github/scan-history")
+async def list_github_scan_history(limit: int = 50):
+    """
+    Return the last ``limit`` (max 50) webhook-triggered pipeline runs, newest
+    first. Consumed by the frontend activity feed.
+
+    Each record includes: id, repo_full_name, pr_number, pr_head_sha,
+    installation_id, triggered_at, findings_count, patches_committed,
+    child_pr_number, child_pr_url, pipeline_status, error_message.
+    """
+    limit = min(limit, 50)
+    try:
+        def fetch():
+            with db_pool.get_cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                        id, repo_full_name, pr_number, pr_head_sha,
+                        installation_id, triggered_at, findings_count,
+                        patches_committed, child_pr_number, child_pr_url,
+                        pipeline_status, error_message
+                    FROM github_scan_events
+                    ORDER BY triggered_at DESC
+                    LIMIT %s
+                    """,
+                    (limit,),
+                )
+                return cur.fetchall()
+
+        rows = await run_in_threadpool(fetch)
+        return [
+            {
+                **dict(r),
+                "triggered_at": (
+                    r["triggered_at"].isoformat()
+                    if r.get("triggered_at") else None
+                ),
+            }
+            for r in (rows or [])
+        ]
+    except Exception as exc:
+        logger.error("Error fetching GitHub scan history: %s", exc)
+        raise HTTPException(
+            status_code=500,
+            detail="Database error while fetching scan history.",
+        )

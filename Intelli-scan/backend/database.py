@@ -1,11 +1,13 @@
 """
 Database connection management with connection pooling and migrations.
 """
+import datetime
 import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from contextlib import contextmanager
-from typing import Generator
+from dataclasses import dataclass
+from typing import Generator, Optional
 import logging
 
 logger = logging.getLogger(__name__)
@@ -63,6 +65,90 @@ class DatabasePool:
         if self.pool:
             self.pool.closeall()
             logger.info("Database pool closed")
+
+
+# ---------------------------------------------------------------------------
+# GitHubScanEvent — typed container for webhook-triggered pipeline runs
+# ---------------------------------------------------------------------------
+
+@dataclass
+class GitHubScanEvent:
+    """
+    Records every webhook-triggered pipeline run for the scan history feed.
+
+    pipeline_status values
+    ----------------------
+    "success"     — pipeline completed, patches committed (possibly 0)
+    "partial"     — pipeline ran but some steps failed gracefully
+    "no_findings" — scan produced zero findings; no patches generated
+    "error"       — pipeline raised an unhandled exception
+    """
+
+    repo_full_name: str
+    pr_number: int
+    pr_head_sha: str
+    installation_id: int
+    triggered_at: datetime.datetime
+    findings_count: int
+    patches_committed: int
+    child_pr_number: Optional[int]
+    child_pr_url: Optional[str]
+    pipeline_status: str   # "success" | "partial" | "no_findings" | "error"
+    error_message: Optional[str]
+    id: Optional[int] = None
+
+
+def log_github_scan_event(database_url: str, event: GitHubScanEvent) -> Optional[int]:
+    """
+    Insert a GitHubScanEvent row into github_scan_events.
+
+    Opens its own connection (not from the pool) so it can be called from
+    background tasks without requiring pool access. Never raises — all errors
+    are logged and None is returned so the pipeline continues cleanly.
+
+    Returns the inserted row id, or None on failure.
+    """
+    try:
+        conn = psycopg2.connect(database_url)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            INSERT INTO github_scan_events (
+                repo_full_name, pr_number, pr_head_sha, installation_id,
+                triggered_at, findings_count, patches_committed,
+                child_pr_number, child_pr_url, pipeline_status, error_message
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+            """,
+            (
+                event.repo_full_name,
+                event.pr_number,
+                event.pr_head_sha,
+                event.installation_id,
+                event.triggered_at,
+                event.findings_count,
+                event.patches_committed,
+                event.child_pr_number,
+                event.child_pr_url,
+                event.pipeline_status,
+                event.error_message,
+            ),
+        )
+        row = cur.fetchone()
+        conn.commit()
+        inserted_id = row[0] if row else None
+        logger.debug("Logged GitHubScanEvent id=%s for %s PR #%d",
+                     inserted_id, event.repo_full_name, event.pr_number)
+        return inserted_id
+    except Exception as exc:
+        logger.error("Failed to log GitHubScanEvent (non-fatal): %s", exc)
+        return None
+    finally:
+        try:
+            cur.close()
+            conn.close()
+        except Exception:
+            pass
 
 
 def create_tables(database_url: str):
@@ -176,7 +262,34 @@ def create_tables(database_url: str):
             CREATE INDEX IF NOT EXISTS idx_audit_logs_entity ON audit_logs(entity_type, entity_id);
             CREATE INDEX IF NOT EXISTS idx_audit_logs_timestamp ON audit_logs(timestamp DESC);
         """)
-        
+
+        # GitHub App webhook-triggered scan history
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS github_scan_events (
+                id                SERIAL PRIMARY KEY,
+                repo_full_name    VARCHAR(255) NOT NULL,
+                pr_number         INTEGER NOT NULL,
+                pr_head_sha       VARCHAR(64) NOT NULL,
+                installation_id   INTEGER NOT NULL,
+                triggered_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                findings_count    INTEGER NOT NULL DEFAULT 0,
+                patches_committed INTEGER NOT NULL DEFAULT 0,
+                child_pr_number   INTEGER,
+                child_pr_url      TEXT,
+                pipeline_status   VARCHAR(50) NOT NULL DEFAULT 'success',
+                error_message     TEXT
+            );
+        """)
+
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_github_scan_events_repo
+                ON github_scan_events(repo_full_name);
+            CREATE INDEX IF NOT EXISTS idx_github_scan_events_triggered_at
+                ON github_scan_events(triggered_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_github_scan_events_pr
+                ON github_scan_events(repo_full_name, pr_number);
+        """)
+
         conn.commit()
         logger.info("✅ Database tables and indexes created successfully")
         
