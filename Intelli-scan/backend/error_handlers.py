@@ -102,11 +102,11 @@ class CircuitBreaker:
 
 
 # Retry decorator for transient failures
-def retry_on_failure(max_attempts: int = 3, min_wait: int = 2, max_wait: int = 10):
+def retry_on_failure(max_attempts: int = 3, min_wait: int = 2, max_wait: int = 60):
     """Decorator for retrying failed operations with exponential backoff."""
     return retry(
         stop=stop_after_attempt(max_attempts),
-        wait=wait_exponential(multiplier=1, min=min_wait, max=max_wait),
+        wait=wait_exponential(multiplier=2, min=min_wait, max=max_wait),
         before_sleep=before_sleep_log(logger, logging.WARNING),
         reraise=True
     )
@@ -146,5 +146,5 @@ def handle_errors(func: Callable) -> Callable:
 
 
 # Global circuit breakers for external services
-gemini_circuit_breaker = CircuitBreaker(failure_threshold=10, timeout=10)
+gemini_circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=60)
 scanner_circuit_breaker = CircuitBreaker(failure_threshold=5, timeout=30)

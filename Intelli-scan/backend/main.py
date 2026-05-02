@@ -7,6 +7,7 @@ import time
 import asyncio
 import hmac
 import hashlib
+import requests
 from starlette.concurrency import run_in_threadpool
 from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Request
 from fastapi.responses import Response, StreamingResponse, JSONResponse
@@ -351,6 +352,91 @@ def get_policy_context() -> str:
     except Exception as e:
         logger.error(f"Could not retrieve policy context: {e}")
         return "Error retrieving security policies."
+
+_SEVERITY_ORDER = {"CRITICAL": 4, "HIGH": 3, "MEDIUM": 2, "LOW": 1, "UNKNOWN": 0}
+
+def _check_policy_violations(sca_result: dict, sast_result: dict) -> list[dict]:
+    """Return list of enabled blocking policies that are violated by the scan findings."""
+    try:
+        with db_pool.get_cursor() as cur:
+            cur.execute(
+                "SELECT name, severity_threshold, block_on_failure FROM scan_policies "
+                "WHERE enabled = TRUE AND block_on_failure = TRUE"
+            )
+            policies = cur.fetchall()
+    except Exception as e:
+        logger.error(f"Could not load policies for enforcement check: {e}")
+        return []
+
+    sca_severities = [
+        v.get("Severity", "UNKNOWN").upper()
+        for result in (sca_result or {}).get("Results", [])
+        for v in (result.get("Vulnerabilities") or [])
+    ]
+    sast_severities = [
+        f.get("extra", {}).get("severity", "UNKNOWN").upper()
+        for f in (sast_result or {}).get("results", [])
+    ]
+    all_severities = sca_severities + sast_severities
+
+    violated = []
+    for policy in policies:
+        threshold = _SEVERITY_ORDER.get(policy["severity_threshold"].upper(), 0)
+        if any(_SEVERITY_ORDER.get(s, 0) >= threshold for s in all_severities):
+            violated.append(dict(policy))
+    return violated
+
+
+def _post_commit_status(
+    repo_full_name: str,
+    commit_sha: str,
+    state: str,
+    description: str,
+    installation_id: Optional[int] = None,
+    scan_uuid: Optional[str] = None,
+) -> None:
+    """Post a GitHub commit status. No-op if credentials are unavailable."""
+    if not repo_full_name or not commit_sha:
+        return
+
+    token = None
+    if installation_id and github_app_configured():
+        try:
+            config = load_github_app_config()
+            token = get_installation_access_token(installation_id, config)
+        except Exception as e:
+            logger.warning(f"Could not get App installation token for commit status: {e}")
+
+    if not token:
+        token = os.environ.get("GITHUB_TOKEN", "")
+
+    if not token:
+        logger.warning("No GitHub token available — skipping commit status post")
+        return
+
+    target_url = (
+        f"https://intelli-scan-api-82554e007164.herokuapp.com/scan/{scan_uuid}"
+        if scan_uuid else ""
+    )
+    payload = {
+        "state": state,
+        "description": description[:140],
+        "context": "intelli-scan / security",
+        "target_url": target_url,
+    }
+    url = f"https://api.github.com/repos/{repo_full_name}/statuses/{commit_sha}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=10)
+        resp.raise_for_status()
+        logger.info(f"Commit status '{state}' posted to {repo_full_name}@{commit_sha[:7]}")
+    except Exception as e:
+        logger.warning(f"Failed to post commit status to GitHub: {e}")
+
 
 @retry_on_failure(max_attempts=settings.ai_max_retries)
 @handle_errors
@@ -787,7 +873,13 @@ def generate_markdown_report(scan: dict) -> str:
     return content
 
 # --- Background Scan Task ---
-async def _perform_scan(scan_uuid: str, repo_url: str):
+async def _perform_scan(
+    scan_uuid: str,
+    repo_url: str,
+    commit_sha: str = "",
+    repo_full_name: str = "",
+    installation_id: Optional[int] = None,
+):
     async def update_status(status: str, message: Optional[str] = None):
         def _update():
             with db_pool.get_cursor() as cur:
@@ -827,7 +919,8 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
                     cur.execute(
                         """
                         UPDATE scans
-                        SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s, finished_at = %s
+                        SET status = %s, sca_result = %s, sast_result = %s, ai_analysis = %s,
+                            finished_at = %s, commit_sha = %s, repo_full_name = %s
                         WHERE uuid = %s
                         RETURNING id
                         """,
@@ -837,6 +930,8 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
                             json.dumps(sast_result),
                             ai_analysis_result.model_dump_json() if ai_analysis_result else None,
                             datetime.datetime.now(datetime.timezone.utc),
+                            commit_sha or None,
+                            repo_full_name or None,
                             scan_uuid
                         )
                     )
@@ -851,9 +946,39 @@ async def _perform_scan(scan_uuid: str, repo_url: str):
                     "sast_findings": sast_count,
                     "sca_findings": sca_count,
                 })
+
+            # --- Policy enforcement + commit status ---
+            if commit_sha and repo_full_name:
+                violations = await run_in_threadpool(_check_policy_violations, sca_result, sast_result)
+                if violations:
+                    names = ", ".join(v["name"] for v in violations)
+                    description = f"FAILED — {len(violations)} polic{'y' if len(violations) == 1 else 'ies'} violated: {names}"
+                    gh_state = "failure"
+                else:
+                    description = f"PASSED — {sast_count + sca_count} finding(s), no blocking policy violations"
+                    gh_state = "success"
+
+                await run_in_threadpool(
+                    _post_commit_status,
+                    repo_full_name, commit_sha, gh_state,
+                    description, installation_id, scan_uuid,
+                )
+                _log_audit_event("scan", scan_db_id, "policy_check_completed", {
+                    "uuid": scan_uuid,
+                    "status": gh_state,
+                    "violations": [v["name"] for v in violations],
+                })
+
         except Exception as e:
             logger.error(f"[{scan_uuid}] Core scan logic failed: {e}")
             await update_status("failed", f"Scan error: {str(e)}")
+            if commit_sha and repo_full_name:
+                await run_in_threadpool(
+                    _post_commit_status,
+                    repo_full_name, commit_sha, "error",
+                    "IntelliScan scan failed — check logs",
+                    installation_id, scan_uuid,
+                )
             return
 
     logger.info(f"[{scan_uuid}] Scan completed and saved to database.")
@@ -1165,6 +1290,10 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     if not repo_url:
         raise HTTPException(status_code=400, detail="No repository clone_url in payload.")
 
+    commit_sha = payload.get("after", "")
+    repo_full_name = payload.get("repository", {}).get("full_name", "")
+    installation_id = payload.get("installation", {}).get("id")
+
     scan_uuid = uuid.uuid4()
     with db_pool.get_cursor() as cur:
         cur.execute(
@@ -1178,11 +1307,26 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     ref = payload.get("ref", "")
     if scan_db_id:
         _log_audit_event("scan", scan_db_id, "webhook_triggered", {
-            "repo_url": repo_url, "ref": ref, "pusher": pusher, "uuid": str(scan_uuid)
+            "repo_url": repo_url, "ref": ref, "pusher": pusher,
+            "uuid": str(scan_uuid), "commit_sha": commit_sha,
         })
 
-    background_tasks.add_task(_perform_scan, str(scan_uuid), repo_url)
-    logger.info(f"GitHub webhook triggered scan {scan_uuid} for {repo_url} (ref={ref}, pusher={pusher})")
+    # Post pending status immediately so developers see the check in-flight
+    if commit_sha:
+        await run_in_threadpool(
+            _post_commit_status,
+            repo_full_name, commit_sha, "pending",
+            "IntelliScan security scan in progress…",
+            installation_id, str(scan_uuid),
+        )
+
+    background_tasks.add_task(
+        _perform_scan, str(scan_uuid), repo_url,
+        commit_sha=commit_sha,
+        repo_full_name=repo_full_name,
+        installation_id=installation_id,
+    )
+    logger.info(f"GitHub webhook triggered scan {scan_uuid} for {repo_url} (ref={ref}, pusher={pusher}, sha={commit_sha[:7] if commit_sha else 'none'})")
     return {"status": "queued", "scan_id": str(scan_uuid)}
 
 
@@ -1276,15 +1420,20 @@ def generate_remediation_pdf(scan_uuid: str):
     if cached_text:
         ai_text = cached_text
     else:
+        policy_context = get_policy_context()
         prompt = f"""
-        You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}    
+        You are a DevSecOps Lead. Create a formal Remediation Patching Plan for: {scan['repo_url']}
         DATA SOURCES:
-        - SCA (Dependencies): {json.dumps(scan['sca_result'])[:10000]} 
+        - SCA (Dependencies): {json.dumps(scan['sca_result'])[:10000]}
         - SAST (Code): {json.dumps(scan['sast_result'])[:10000]}
 
+        INTERNAL SECURITY POLICIES:
+        {policy_context}
+
         OUTPUT FORMAT:
-        Provide a professional, step-by-step patching guide. 
+        Provide a professional, step-by-step patching guide.
         Focus ONLY on High/Critical severities.
+        Align your recommendations with the internal security policies above where applicable.
         Do not use Markdown formatting (like **bold**), just plain text with clear headers.
         """
         

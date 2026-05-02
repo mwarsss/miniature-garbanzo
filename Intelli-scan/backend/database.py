@@ -177,10 +177,23 @@ def create_tables(database_url: str):
         
         # Ensure error_message column exists for older table versions
         cur.execute("""
-            DO $$ 
-            BEGIN 
+            DO $$
+            BEGIN
                 IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scans' AND column_name='error_message') THEN
                     ALTER TABLE scans ADD COLUMN error_message TEXT;
+                END IF;
+            END $$;
+        """)
+
+        # Add commit_sha and repo_full_name for GitHub commit status reporting
+        cur.execute("""
+            DO $$
+            BEGIN
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scans' AND column_name='commit_sha') THEN
+                    ALTER TABLE scans ADD COLUMN commit_sha VARCHAR(40);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='scans' AND column_name='repo_full_name') THEN
+                    ALTER TABLE scans ADD COLUMN repo_full_name VARCHAR(255);
                 END IF;
             END $$;
         """)
