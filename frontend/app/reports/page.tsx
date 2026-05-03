@@ -136,25 +136,29 @@ export default function ReportsPage() {
     setRemediating(true);
     setRemediationPlan(null);
     setError(null);
-    try {
-      console.log("Fetching remediation for scan ID:", selectedScan);
-      const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${selectedScan}/remediation`);
-      if (res.ok) {
-        const data = await res.json();
-        setRemediationPlan(data);
-      } else {
-        const errorData = await res.json();
-        const errorMessage = errorData.detail || "An unknown error occurred.";
-        console.error("Failed to get remediation plan:", errorMessage);
-        setError(`Error generating remediation: ${errorMessage}`);
+
+    const poll = async (): Promise<void> => {
+      try {
+        const res = await fetch(`https://intelli-scan-api-82554e007164.herokuapp.com/scan/${selectedScan}/remediation`);
+        if (res.status === 202) {
+          setTimeout(poll, 5000);
+          return;
+        }
+        if (res.ok) {
+          const data = await res.json();
+          setRemediationPlan(data);
+        } else {
+          const errorData = await res.json().catch(() => ({}));
+          setError(`Error generating remediation: ${errorData.detail || "An unknown error occurred."}`);
+        }
+      } catch (error) {
+        console.error("Remediation fetch error:", error);
+        setError("An unexpected error occurred while fetching the remediation plan.");
       }
-    } catch (error) {
-      console.error("Remediation fetch error:", error);
-      setError("An unexpected error occurred while fetching the remediation plan.");
-    }
-    finally {
       setRemediating(false);
-    }
+    };
+
+    await poll();
   };
 
   const downloadReport = (content: string, filename: string) => {

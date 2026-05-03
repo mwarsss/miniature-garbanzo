@@ -1020,19 +1020,51 @@ def list_scans(limit: int = 50):
         logger.error(f"Error listing scans: {e}")
         raise HTTPException(status_code=500, detail="Database error while fetching scans.")
 
-@app.get("/scan/{scan_id}/remediation", response_model=List[RemediationResult])
-async def get_remediation_plan(scan_id: str):
-    """
-    Run the agentic 5-step remediation pipeline over every finding in the scan.
+async def _run_remediation_background(scan_id: str, cache_key: str, findings: list, repo_url: str, gemini_model) -> None:
+    """Background task: run pipeline, write results to cache when done."""
+    def _blocking():
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            if repo_url:
+                try:
+                    from git import Repo as _Repo
+                    _Repo.clone_from(repo_url, tmp_dir, depth=1)
+                    logger.info(f"Re-cloned {repo_url} for remediation scan_id={scan_id}")
+                except Exception as clone_err:
+                    logger.warning(f"Re-clone failed ({clone_err}); context agent will use snippets only")
+            scan_output = {"tool": "semgrep", "findings": findings, "repo_local_path": tmp_dir}
+            return run_remediation_pipeline(
+                scan_output,
+                gemini_model=gemini_model,
+                semgrep_path=settings.semgrep_path,
+            )
+    try:
+        results = await run_in_threadpool(_blocking)
+        cache.set(cache_key, results, ttl=86400)
+        logger.info(f"Remediation pipeline complete for scan_id={scan_id}, {len(results)} results cached")
+    except Exception as e:
+        logger.error(f"Agentic remediation pipeline failed for scan {scan_id}: {e}")
+        cache.delete(cache_key)
 
-    The repo is re-cloned into a temp directory for context extraction and
-    Semgrep re-validation, then cleaned up automatically.  Results are cached
-    for 24 hours to avoid redundant re-clones.
+
+_REMEDIATION_PROCESSING = "__processing__"
+
+
+@app.get("/scan/{scan_id}/remediation")
+async def get_remediation_plan(scan_id: str, background_tasks: BackgroundTasks):
+    """
+    Returns remediation results when ready (200) or 202 while the pipeline runs.
+
+    First call kicks the pipeline off as a background task and returns 202.
+    The client should poll every 5 seconds until it receives 200.
+    Results are cached for 24 hours.
     """
     cache_key = f"agentic_remediation_{scan_id}"
     cached = cache.get(cache_key)
-    if cached:
-        return cached
+
+    if cached is not None:
+        if cached == _REMEDIATION_PROCESSING:
+            return JSONResponse(status_code=202, content={"status": "processing"})
+        return JSONResponse(status_code=200, content=cached)
 
     try:
         scan_id_int = int(scan_id)
@@ -1055,7 +1087,6 @@ async def get_remediation_plan(scan_id: str):
     if scan["status"] != "completed":
         raise HTTPException(status_code=400, detail="Scan not completed.")
 
-    # Normalise raw Semgrep JSON into the findings format expected by the pipeline
     sast_raw = scan["sast_result"] or {}
     raw_findings = sast_raw.get("results", [])
     findings = [
@@ -1072,41 +1103,16 @@ async def get_remediation_plan(scan_id: str):
         for i, f in enumerate(raw_findings)
     ]
 
-    # Re-clone repo so Context Agent and Semgrep Validator have file access
     repo_url: str = scan.get("repo_url", "")
     gemini_model = ai_models[0] if ai_models else None
 
-    async def _run_pipeline():
-        """Clone repo, run pipeline, clean up — executed in a thread."""
-        def _blocking():
-            with tempfile.TemporaryDirectory() as tmp_dir:
-                if repo_url:
-                    try:
-                        from git import Repo as _Repo
-                        _Repo.clone_from(repo_url, tmp_dir, depth=1)
-                        logger.info(f"Re-cloned {repo_url} for remediation scan_id={scan_id}")
-                    except Exception as clone_err:
-                        logger.warning(f"Re-clone failed ({clone_err}); context agent will use snippets only")
-                scan_output = {
-                    "tool": "semgrep",
-                    "findings": findings,
-                    "repo_local_path": tmp_dir,
-                }
-                return run_remediation_pipeline(
-                    scan_output,
-                    gemini_model=gemini_model,
-                    semgrep_path=settings.semgrep_path,
-                )
-        return await run_in_threadpool(_blocking)
-
-    try:
-        results = await _run_pipeline()
-    except Exception as e:
-        logger.error(f"Agentic remediation pipeline failed for scan {scan_id}: {e}")
-        raise HTTPException(status_code=500, detail="Remediation pipeline failed.")
-
-    cache.set(cache_key, results, ttl=86400)
-    return results
+    # Mark as processing so concurrent requests don't double-launch
+    cache.set(cache_key, _REMEDIATION_PROCESSING, ttl=3600)
+    background_tasks.add_task(
+        _run_remediation_background, scan_id, cache_key, findings, repo_url, gemini_model
+    )
+    logger.info(f"Remediation pipeline queued as background task for scan_id={scan_id} ({len(findings)} findings)")
+    return JSONResponse(status_code=202, content={"status": "processing"})
 
 @app.get("/scan/{scan_id}", response_model=ScanStatus)
 def get_scan_status(scan_id: uuid.UUID):
