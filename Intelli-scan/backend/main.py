@@ -291,6 +291,60 @@ def _extract_cvss_cve_summary(sca_result: dict) -> list[dict]:
     return sorted(entries, key=lambda x: (x.get("cvss_score") or 0), reverse=True)
 
 
+def _normalize_sca_findings(sca_result: dict) -> list[dict]:
+    """
+    Convert Trivy SCA output into the flat finding dicts the remediation
+    agent pipeline expects.
+
+    Each Trivy vulnerability becomes one finding whose file_path is the
+    dependency manifest (e.g. package.json / pom.xml) so the Context Agent
+    can open the file and generate a version-bump patch.
+    """
+    findings: list[dict] = []
+    seen: set[str] = set()
+
+    for target in (sca_result or {}).get("Results", []):
+        manifest_path = target.get("Target", "")
+        for vuln in (target.get("Vulnerabilities") or []):
+            cve_id = vuln.get("VulnerabilityID", "")
+            pkg = vuln.get("PkgName", "unknown")
+            installed = vuln.get("InstalledVersion", "?")
+            fixed = vuln.get("FixedVersion", "")
+            severity = (vuln.get("Severity") or "UNKNOWN").upper()
+            title = vuln.get("Title") or vuln.get("Description") or cve_id
+
+            if severity == "UNKNOWN":
+                continue
+
+            uid = f"{cve_id}_{pkg}"
+            if uid in seen:
+                continue
+            seen.add(uid)
+
+            fix_note = f"Upgrade to {fixed}." if fixed else "No upstream fix available yet — consider replacing the package."
+            message = (
+                f"{cve_id} in {pkg} {installed}: {title}. {fix_note}"
+            )
+
+            findings.append({
+                "id": uid,
+                "severity": severity,
+                "file_path": manifest_path,
+                "line_start": 1,
+                "line_end": 1,
+                "vuln_type": f"dependency_vulnerability",
+                "message": message,
+                "raw_code_snippet": "",
+                # Extra context for the patch prompt
+                "package_name": pkg,
+                "installed_version": installed,
+                "fixed_version": fixed,
+                "cve_id": cve_id,
+            })
+
+    return findings
+
+
 def _log_audit_event(entity_type: str, entity_id: int, action: str, changes: Optional[dict] = None) -> None:
     """Write a row to audit_logs. Silently swallows errors to never block the main flow."""
     try:
@@ -1071,7 +1125,7 @@ async def get_remediation_plan(scan_id: str, background_tasks: BackgroundTasks):
         def fetch_scan():
             with db_pool.get_cursor() as cur:
                 cur.execute(
-                    "SELECT status, sast_result, repo_url FROM scans WHERE id = %s",
+                    "SELECT status, sast_result, sca_result, repo_url FROM scans WHERE id = %s",
                     (scan_id_int,),
                 )
                 return cur.fetchone()
@@ -1087,9 +1141,10 @@ async def get_remediation_plan(scan_id: str, background_tasks: BackgroundTasks):
     if scan["status"] != "completed":
         raise HTTPException(status_code=400, detail="Scan not completed.")
 
+    # --- SAST findings (Semgrep) ---
     sast_raw = scan["sast_result"] or {}
     raw_findings = sast_raw.get("results", [])
-    findings = [
+    sast_findings = [
         {
             "id": f.get("check_id", f"finding-{i}"),
             "severity": (f.get("extra", {}).get("severity") or "LOW").upper(),
@@ -1102,6 +1157,15 @@ async def get_remediation_plan(scan_id: str, background_tasks: BackgroundTasks):
         }
         for i, f in enumerate(raw_findings)
     ]
+
+    # --- SCA findings (Trivy) ---
+    sca_findings = _normalize_sca_findings(scan["sca_result"] or {})
+
+    findings = sast_findings + sca_findings
+    logger.info(
+        "Remediation: scan_id=%s — %d SAST + %d SCA = %d total findings",
+        scan_id, len(sast_findings), len(sca_findings), len(findings),
+    )
 
     repo_url: str = scan.get("repo_url", "")
     gemini_model = ai_models[0] if ai_models else None

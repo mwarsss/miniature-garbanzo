@@ -407,7 +407,45 @@ class RemediationAgent:
             else "The enclosing function/class could not be determined."
         )
 
-        prompt = f"""You are a senior application security engineer tasked with fixing a specific \
+        # SCA (dependency) findings get a specialised prompt — no line-level patch needed
+        is_sca = finding.get("vuln_type") == "dependency_vulnerability"
+        if is_sca:
+            pkg = finding.get("package_name", finding.get("id", "unknown"))
+            installed = finding.get("installed_version", "?")
+            fixed = finding.get("fixed_version", "")
+            cve_id = finding.get("cve_id", "")
+            fix_instruction = (
+                f"Upgrade `{pkg}` from `{installed}` to `{fixed}`."
+                if fixed else
+                f"No upstream fix is available for `{pkg}` {installed}. "
+                "Suggest the safest mitigation (e.g. remove, replace, or pin with a comment)."
+            )
+            prompt = f"""You are a senior DevSecOps engineer fixing a vulnerable dependency.
+
+## Vulnerability
+- CVE / ID: {cve_id}
+- Package: {pkg} (installed: {installed})
+- Severity: {finding.get('severity', 'UNKNOWN')}
+- Finding: {finding.get('message', '')}
+
+## Dependency Manifest
+File: {finding.get('file_path', 'dependency manifest')}
+```
+{file_content or '(file not available — provide a generic patch example)'}
+```
+
+## Task
+{fix_instruction}
+
+Respond with ONLY a JSON object (no markdown, no commentary):
+{{
+  "patched_code": "<the complete corrected manifest content, or a minimal diff-style snippet if the full file is unavailable>",
+  "explanation": "<one paragraph: what the CVE is, why the package is dangerous, and what the fix does>",
+  "confidence": <float 0.0–1.0>
+}}
+"""
+        else:
+            prompt = f"""You are a senior application security engineer tasked with fixing a specific \
 security vulnerability in source code.
 
 ## Vulnerability Details

@@ -146,7 +146,7 @@ export default function ReportsPage() {
         }
         if (res.ok) {
           const data = await res.json();
-          setRemediationPlan(data);
+          setRemediationPlan(Array.isArray(data) ? data : []);
         } else {
           const errorData = await res.json().catch(() => ({}));
           setError(`Error generating remediation: ${errorData.detail || "An unknown error occurred."}`);
@@ -308,25 +308,53 @@ export default function ReportsPage() {
             {remediationPlan && (
               <div className="mt-8 animate-in fade-in slide-in-from-bottom-4">
                 <h3 className="text-xl font-bold text-white mb-1">AI Remediation Plan</h3>
-                <p className="text-sm text-slate-400 mb-4">{remediationPlan.length} finding{remediationPlan.length !== 1 ? 's' : ''} analysed</p>
+                <p className="text-sm text-slate-400 mb-4">
+                  {remediationPlan.length} finding{remediationPlan.length !== 1 ? 's' : ''} analysed
+                  {remediationPlan.length > 0 && (
+                    <span className="ml-2">
+                      · <span className="text-blue-400">{remediationPlan.filter(f => f.vuln_type !== 'dependency_vulnerability').length} SAST</span>
+                      {' · '}
+                      <span className="text-violet-400">{remediationPlan.filter(f => f.vuln_type === 'dependency_vulnerability').length} SCA</span>
+                    </span>
+                  )}
+                </p>
                 {remediationPlan.length === 0 ? (
                   <div className="p-6 bg-slate-900 border border-slate-800 rounded-xl text-slate-400 text-sm text-center">
-                    No SAST findings found in this scan — nothing to remediate.
+                    No findings from SAST or SCA scans — nothing to remediate.
                   </div>
                 ) : (
                   <div className="space-y-4">
                     {remediationPlan.map((item, index) => {
+                      const isSca = item.vuln_type === 'dependency_vulnerability';
                       const verdictColor = item.verdict === 'AUTO_APPLY'
                         ? 'text-emerald-400 bg-emerald-900/20 border-emerald-800'
                         : item.verdict === 'REVIEW_RECOMMENDED'
                         ? 'text-amber-400 bg-amber-900/20 border-amber-800'
                         : 'text-rose-400 bg-rose-900/20 border-rose-800';
+
+                      // For SCA findings the id is "CVE-XXXX-XXXX_pkgname" — split for display
+                      const [cveId, pkgName] = isSca
+                        ? item.finding_id.split('_').reduce<[string, string]>(
+                            ([cve, pkg], part, i) => i === 0 ? [part, pkg] : [cve, pkg ? `${pkg}_${part}` : part],
+                            ['', '']
+                          )
+                        : ['', ''];
+
+                      const cardTitle = isSca
+                        ? `${cveId}${pkgName ? ` · ${pkgName}` : ''}`
+                        : item.vuln_type.replace(/_/g, ' ').toUpperCase();
+
                       return (
                         <div key={item.finding_id} className="bg-slate-900 border border-slate-800 rounded-xl p-6">
                           <div className="flex items-start justify-between gap-4 mb-3">
-                            <div>
-                              <p className="text-xs text-slate-500 font-mono mb-1">{item.file_path}</p>
-                              <h4 className="font-bold text-base text-white">{index + 1}. {item.vuln_type.replace(/_/g, ' ').toUpperCase()}</h4>
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2 mb-1">
+                                <span className={`text-xs font-semibold px-1.5 py-0.5 rounded ${isSca ? 'bg-violet-900/40 text-violet-400 border border-violet-800' : 'bg-blue-900/40 text-blue-400 border border-blue-800'}`}>
+                                  {isSca ? 'SCA' : 'SAST'}
+                                </span>
+                                <p className="text-xs text-slate-500 font-mono truncate">{item.file_path}</p>
+                              </div>
+                              <h4 className="font-bold text-base text-white">{index + 1}. {cardTitle}</h4>
                             </div>
                             <div className="flex items-center gap-2 flex-shrink-0">
                               {item.ris_score != null && (
@@ -348,7 +376,7 @@ export default function ReportsPage() {
                               )}
                               {item.patched_code && (
                                 <>
-                                  <p className="text-xs text-slate-400 uppercase font-semibold mb-2">Suggested Fix:</p>
+                                  <p className="text-xs text-slate-400 uppercase font-semibold mb-2">{isSca ? 'Suggested Version Fix:' : 'Suggested Fix:'}</p>
                                   <code className="block w-full bg-slate-950 p-4 rounded-lg text-sm text-slate-200 border border-slate-700 whitespace-pre-wrap font-mono">
                                     {item.patched_code}
                                   </code>

@@ -19,4 +19,59 @@
   }
 }
 
+/* ================================================
+   Light mode — invert the slate palette end-to-end
+   The app is designed dark-first, so we swap each
+   slate step with its mirror (50↔950, 100↔900 …).
+   Indigo / emerald / rose accent colours are kept.
+   ================================================ */
+html:not(.dark) {
+  color-scheme: light;
+
+  --color-slate-950: oklch(0.984 0.003 247.858); /* ← was slate-50  */
+  --color-slate-900: oklch(0.968 0.007 247.896); /* ← was slate-100 */
+  --color-slate-800: oklch(0.929 0.013 255.508); /* ← was slate-200 */
+  --color-slate-700: oklch(0.869 0.022 264.532); /* ← was slate-300 */
+  --color-slate-600: oklch(0.704 0.04  256.788); /* ← was slate-400 */
+  /* slate-500 stays — it's the midpoint */
+  --color-slate-400: oklch(0.446 0.043 257.281); /* ← was slate-600 */
+  --color-slate-300: oklch(0.372 0.044 257.287); /* ← was slate-700 */
+  --color-slate-200: oklch(0.279 0.041 260.031); /* ← was slate-800 */
+  --color-slate-100: oklch(0.208 0.042 265.755); /* ← was slate-900 */
+  --color-slate-50:  oklch(0.129 0.042 264.695); /* ← was slate-950 */
+}
+
+/* text-white → readable slate in light mode */
+html:not(.dark) .text-white {
+  color: #334155 !important; /* slate-700 — readable but not harsh */
+}
+
+/* Sidebar brand "IntelliScan" gets a soft indigo instead */
+html:not(.dark) aside span.font-bold {
+  color: #4f46e5 !important; /* indigo-600 */
+}
+
+/* Restore white text when it sits on a coloured background */
+html:not(.dark) [class*="bg-indigo"] .text-white,
+html:not(.dark) [class*="bg-indigo"].text-white,
+html:not(.dark) [class*="bg-emerald"] .text-white,
+html:not(.dark) [class*="bg-emerald"].text-white,
+html:not(.dark) [class*="bg-rose"] .text-white,
+html:not(.dark) [class*="bg-rose"].text-white,
+html:not(.dark) [class*="bg-blue"] .text-white,
+html:not(.dark) [class*="bg-blue"].text-white {
+  color: white !important;
+}
+
+/* The toggle button itself always matches the current mode */
+html:not(.dark) .theme-toggle-btn {
+  background-color: oklch(0.929 0.013 255.508);
+  border-color: oklch(0.869 0.022 264.532);
+  color: oklch(0.208 0.042 265.755);
+}
+html:not(.dark) .theme-toggle-btn:hover {
+  background-color: oklch(0.869 0.022 264.532);
+  color: oklch(0.129 0.042 264.695);
+}
+
 
