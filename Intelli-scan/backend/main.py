@@ -766,7 +766,8 @@ async def _run_semgrep_scan(directory: str) -> dict:
             "--config=p/security-audit",
             "--json",
             "--timeout", "5",
-            "--jobs", "2",
+            "--jobs", "1",
+            "--max-memory", "400",
             "--exclude", "*.min.js",
             "--exclude", "package-lock.json",
             directory
