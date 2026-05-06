@@ -16,7 +16,7 @@ from git import Repo, GitCommandError
 from typing import Dict, List, Optional
 import uuid
 from fastapi.middleware.cors import CORSMiddleware
-import google.generativeai as genai
+from google import genai
 import datetime
 from pypdf import PdfReader
 import io
@@ -103,15 +103,36 @@ app.add_middleware(
 )
 
 # --- Google Generative AI Configuration ---
-# Pre-create one model instance per API key to avoid race conditions.
-# genai.configure() sets a global key, which is unsafe in async contexts
-# where concurrent requests could overwrite each other's configured key.
-ai_models: list[genai.GenerativeModel] = []
+
+class _GenAIAdapter:
+    """
+    Wraps google-genai Client so every call site keeps the same
+    .generate_content() / .generate_content_async() interface.
+    One instance per API key — no shared global state.
+    """
+    def __init__(self, client: genai.Client, model_name: str):
+        self._client = client
+        self._model_name = model_name
+
+    def generate_content(self, prompt: str):
+        return self._client.models.generate_content(
+            model=self._model_name,
+            contents=prompt,
+        )
+
+    async def generate_content_async(self, prompt: str):
+        return await self._client.aio.models.generate_content(
+            model=self._model_name,
+            contents=prompt,
+        )
+
+
+ai_models: list[_GenAIAdapter] = []
 if settings.google_api_keys:
     model_name = settings.ai_model_name
     for key in settings.google_api_keys:
-        genai.configure(api_key=key)
-        ai_models.append(genai.GenerativeModel(model_name))
+        client = genai.Client(api_key=key)
+        ai_models.append(_GenAIAdapter(client, model_name))
     logger.info(f"✅ Gemini AI configured with {len(ai_models)} model instances and model: {model_name}")
 else:
     logger.warning("⚠️ GOOGLE_API_KEY not set. AI features will be disabled.")

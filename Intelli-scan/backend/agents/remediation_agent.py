@@ -15,7 +15,7 @@ ASSUMPTIONS
    fails for any reason, the agent transparently falls back to plain-text
    slicing for context extraction — no crash.
 3. The Gemini model instance must be passed to run_remediation_pipeline() as
-   `gemini_model`. It must be a google.generativeai.GenerativeModel object
+   `gemini_model`. It must be a _GenAIAdapter (google-genai backed) object
    with a synchronous generate_content() method. If None, all patch steps
    produce confidence=0.0 / patched_code=None (degraded mode).
 4. Semgrep validation is best-effort. If `semgrep` is not on PATH, the step
@@ -143,7 +143,7 @@ class RemediationAgent:
         Parameters
         ----------
         gemini_model:
-            A pre-configured google.generativeai.GenerativeModel instance.
+            A pre-configured _GenAIAdapter (google-genai backed) instance.
             If None, the patch step returns a degraded (no-op) result.
         semgrep_path:
             Path or command name for the Semgrep binary. Defaults to 'semgrep'.
@@ -752,7 +752,7 @@ def run_remediation_pipeline(
         Normalised scanner output with keys ``findings`` (list) and
         ``repo_local_path`` (str).
     gemini_model :
-        A pre-configured ``google.generativeai.GenerativeModel`` instance.
+        A pre-configured ``_GenAIAdapter (google-genai backed)`` instance.
         Pass ``None`` to run in degraded mode (no AI patches).
     semgrep_path : str
         Path or command name for the Semgrep binary.
