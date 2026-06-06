@@ -265,6 +265,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**Project Status:** This is a capstone project for the Bachelor of Technology in Software Engineering program. Currently under active development.
+**Project Status:** This is a capstone project for the Bachelor of Technology in Information Security and Assurance program. Currently under active development.
 
 Built with ❤️ by the Intelli-Scan Team
