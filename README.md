@@ -56,4 +56,4 @@ This project is containerized with Docker. No need to install a million dependen
     Check the terminal where docker-compose is running to see the JSON output.
 
 ---
-**Project Status:** This is a capstone project for the Bachelor of Technology in Software Engineering program. It is currently under active development.
+**Project Status:** This is a capstone project for the Bachelor of Technology Honours in Information Security and Assurance at Harare Institute of Technology. It is currently under active development.
